@@ -1,30 +1,37 @@
 # Screen Draw
 
-A lightweight screen annotation tool for Linux (Wayland/GNOME), inspired by Gromit-MPX.
+A lightweight screen annotation tool for Linux (GNOME/Wayland), inspired by [Gromit-MPX](https://github.com/bk138/gromit-mpx).
 
-Draw directly over your screen with pens, shapes, and erasers — toggle it on/off with a keyboard shortcut.
+Draw directly over your screen with pens, shapes, and erasers — toggle it on/off with **F9**.
 
 ## Features
 
-- **Toggle overlay** with `F9` (configurable)
-- **Pen tool** with customizable color and stroke width
-- **Eraser tool**
+- **Toggle overlay** with `F9` (via GNOME custom keybindings + D-Bus)
+- **Pen tool** with customizable color and stroke width (click pen icon for options)
+- **Eraser tool** with visual cursor circle
 - **Predefined shapes**: Rectangle, Circle, Arrow, Line
 - **Undo/Redo** support
 - **Clear canvas** shortcut
-- Runs natively on Wayland (GNOME) via `gtk-layer-shell`
+- Smooth Bézier curve rendering for freehand strokes
+- Dark, floating toolbar with modern glassmorphic design
+- Runs natively on **GNOME/Wayland** (Fedora, Ubuntu, etc.)
 
 ## Requirements
 
 - Python 3.10+
 - GTK 3 (`python3-gobject`, `gtk3`)
-- `gtk-layer-shell` (for Wayland overlay)
-- `libkeybinder3` (for global hotkey)
+- GNOME desktop (for custom keybinding registration)
 
 ### Install dependencies (Fedora)
 
 ```bash
-sudo dnf install -y gtk-layer-shell gtk3-layer-shell python3-gobject keybinder3
+sudo dnf install -y python3-gobject gtk3
+```
+
+Or use the install script:
+
+```bash
+./install.sh
 ```
 
 ## Usage
@@ -33,17 +40,46 @@ sudo dnf install -y gtk-layer-shell gtk3-layer-shell python3-gobject keybinder3
 python3 screen_draw.py
 ```
 
-Press **F9** to toggle the drawing overlay on/off.
+The app starts hidden. Press **F9** to toggle the drawing overlay.
+
+## Architecture
+
+- **Global Hotkey**: Registered via GNOME custom keybindings (`gsettings`). Pressing F9 triggers a `gdbus` call to the app's D-Bus service.
+- **D-Bus Service**: Exposes `Toggle`, `Show`, `Hide`, and `Quit` methods at `com.tools.ScreenDraw`.
+- **Drawing**: Uses Cairo on a transparent fullscreen GTK window with `DOCK` type hint.
+- **Canvas**: Persistent `ImageSurface` with stroke-based undo/redo.
 
 ## Keyboard Shortcuts
 
-| Key       | Action                  |
-|-----------|-------------------------|
-| `F9`      | Toggle overlay          |
-| `Ctrl+Z`  | Undo                    |
-| `Ctrl+Y`  | Redo                    |
-| `Ctrl+C`  | Clear canvas            |
-| `Escape`  | Hide overlay            |
+| Key       | Action                     |
+|-----------|----------------------------|
+| `F9`      | Toggle overlay (global)    |
+| `P`       | Pen tool                   |
+| `E`       | Eraser tool                |
+| `L`       | Line shape                 |
+| `R`       | Rectangle shape            |
+| `O`       | Circle/oval shape          |
+| `A`       | Arrow shape                |
+| `Ctrl+Z`  | Undo                       |
+| `Ctrl+Y`  | Redo                       |
+| `Ctrl+X`  | Clear canvas               |
+| `Escape`  | Hide overlay               |
+
+## D-Bus Control
+
+You can also control Screen Draw programmatically:
+
+```bash
+# Toggle the overlay
+gdbus call --session --dest com.tools.ScreenDraw \
+  --object-path /com/tools/ScreenDraw \
+  --method com.tools.ScreenDraw.Toggle
+
+# Quit the app
+gdbus call --session --dest com.tools.ScreenDraw \
+  --object-path /com/tools/ScreenDraw \
+  --method com.tools.ScreenDraw.Quit
+```
 
 ## License
 

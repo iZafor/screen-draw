@@ -1,38 +1,52 @@
 #!/usr/bin/env python3
 """
-Screen Draw — A Gromit-MPX inspired screen annotation tool.
+Screen Draw — A Gromit-MPX inspired screen annotation tool for GNOME/Wayland.
 
 Draw over your entire screen with pens, erasers, and shapes.
 Toggle the overlay with F9.
 """
 
+import os
 import sys
 import math
+import signal
+import subprocess
+import warnings
 import cairo
 import gi
+
+# Suppress harmless Gio deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="screen_draw")
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 
-from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
+from gi.repository import Gtk, Gdk, GLib, Gio
 
-# Try to import gtk-layer-shell for Wayland overlay support
-HAS_LAYER_SHELL = False
-try:
-    gi.require_version("GtkLayerShell", "0.1")
-    from gi.repository import GtkLayerShell
-    HAS_LAYER_SHELL = True
-except (ValueError, ImportError):
-    print("[warn] gtk-layer-shell not found. Falling back to X11-style overlay.")
 
-# Try to import Keybinder for global hotkeys
-HAS_KEYBINDER = False
-try:
-    gi.require_version("Keybinder", "3.0")
-    from gi.repository import Keybinder
-    HAS_KEYBINDER = True
-except (ValueError, ImportError):
-    print("[warn] Keybinder not found. Global hotkey (F9) may not work when overlay is hidden.")
+# ─── D-Bus Service for Global Hotkey ──────────────────────────────────────────
+
+DBUS_NAME = "com.tools.ScreenDraw"
+DBUS_PATH = "/com/tools/ScreenDraw"
+DBUS_IFACE = "com.tools.ScreenDraw"
+
+DBUS_XML = """
+<node>
+  <interface name="com.tools.ScreenDraw">
+    <method name="Toggle"/>
+    <method name="Show"/>
+    <method name="Hide"/>
+    <method name="Quit"/>
+  </interface>
+</node>
+"""
+
+# GNOME Custom Keybinding constants
+GS_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
+GS_KEY = "custom-keybindings"
+GS_CUSTOM_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding"
+KEYBINDING_SLOT = "screen-draw"
+KEYBINDING_PATH_PREFIX = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -52,18 +66,27 @@ COLOR_PRESETS = [
     ("#FFCC00", "Yellow"),
     ("#34C759", "Green"),
     ("#007AFF", "Blue"),
+    ("#5856D6", "Indigo"),
     ("#AF52DE", "Purple"),
     ("#FF2D55", "Pink"),
     ("#FFFFFF", "White"),
+    ("#8E8E93", "Gray"),
     ("#000000", "Black"),
 ]
 
-STROKE_PRESETS = [2, 4, 6, 8, 12, 16, 24]
+STROKE_PRESETS = [2, 3, 5, 8, 12, 18, 26]
 
-TOOLBAR_HEIGHT = 52
-TOOLBAR_PADDING = 6
-TOOLBAR_RADIUS = 14
-TOOLBAR_GAP = 6
+TOOLBAR_HEIGHT = 50
+TOOLBAR_PADDING = 5
+TOOLBAR_RADIUS = 16
+TOOLBAR_BTN_SIZE = 40
+TOOLBAR_GAP = 4
+
+# Submenu dimensions
+SM_COLOR_SWATCH = 26
+SM_COLOR_GAP = 8
+SM_STROKE_PILL_W = 34
+SM_STROKE_PILL_H = 26
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -77,17 +100,28 @@ def hex_to_rgba(hex_color, alpha=1.0):
     return (r, g, b, alpha)
 
 
-def point_distance(x1, y1, x2, y2):
-    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+def rounded_rect(cr, x, y, w, h, r):
+    """Draw a rounded rectangle path."""
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
 
 
-# ─── Stroke Data Classes ─────────────────────────────────────────────────────
+def lerp_color(c1, c2, t):
+    """Linear interpolation between two RGBA tuples."""
+    return tuple(a + (b - a) * t for a, b in zip(c1, c2))
+
+
+# ─── Stroke Data ─────────────────────────────────────────────────────────────
 
 class FreehandStroke:
-    """A freehand pen/eraser stroke."""
+    """A freehand pen or eraser stroke with Catmull-Rom smoothing."""
 
     def __init__(self, points, color, width, is_eraser=False):
-        self.points = points  # list of (x, y)
+        self.points = points
         self.color = color
         self.width = width
         self.is_eraser = is_eraser
@@ -105,14 +139,29 @@ class FreehandStroke:
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
 
-        cr.move_to(self.points[0][0], self.points[0][1])
-        for px, py in self.points[1:]:
-            cr.line_to(px, py)
+        pts = self.points
+        cr.move_to(pts[0][0], pts[0][1])
+
+        if len(pts) == 2:
+            cr.line_to(pts[1][0], pts[1][1])
+        else:
+            # Quadratic Bézier smoothing
+            for i in range(1, len(pts) - 1):
+                xc = (pts[i][0] + pts[i + 1][0]) / 2
+                yc = (pts[i][1] + pts[i + 1][1]) / 2
+                cr.curve_to(
+                    pts[i][0], pts[i][1],
+                    pts[i][0], pts[i][1],
+                    xc, yc,
+                )
+            # Last point
+            cr.line_to(pts[-1][0], pts[-1][1])
+
         cr.stroke()
 
 
 class ShapeStroke:
-    """A geometric shape stroke (line, rect, circle, arrow)."""
+    """A geometric shape stroke."""
 
     def __init__(self, shape_type, x1, y1, x2, y2, color, width):
         self.shape_type = shape_type
@@ -139,21 +188,22 @@ class ShapeStroke:
             y = min(self.y1, self.y2)
             w = abs(self.x2 - self.x1)
             h = abs(self.y2 - self.y1)
-            cr.rectangle(x, y, w, h)
-            cr.stroke()
+            if w > 0 and h > 0:
+                cr.rectangle(x, y, w, h)
+                cr.stroke()
 
         elif self.shape_type == TOOL_CIRCLE:
             cx = (self.x1 + self.x2) / 2
             cy = (self.y1 + self.y2) / 2
             rx = abs(self.x2 - self.x1) / 2
             ry = abs(self.y2 - self.y1) / 2
-            cr.save()
-            cr.translate(cx, cy)
             if rx > 0 and ry > 0:
+                cr.save()
+                cr.translate(cx, cy)
                 cr.scale(1.0, ry / rx)
                 cr.arc(0, 0, rx, 0, 2 * math.pi)
-            cr.restore()
-            cr.stroke()
+                cr.restore()
+                cr.stroke()
 
         elif self.shape_type == TOOL_ARROW:
             cr.move_to(self.x1, self.y1)
@@ -161,47 +211,47 @@ class ShapeStroke:
             cr.stroke()
             # Arrowhead
             angle = math.atan2(self.y2 - self.y1, self.x2 - self.x1)
-            head_len = max(self.width * 3, 18)
-            head_angle = math.pi / 6
-            lx = self.x2 - head_len * math.cos(angle - head_angle)
-            ly = self.y2 - head_len * math.sin(angle - head_angle)
-            rx = self.x2 - head_len * math.cos(angle + head_angle)
-            ry = self.y2 - head_len * math.sin(angle + head_angle)
-            cr.move_to(self.x2, self.y2)
-            cr.line_to(lx, ly)
-            cr.move_to(self.x2, self.y2)
-            cr.line_to(rx, ry)
-            cr.stroke()
+            head_len = max(self.width * 3.5, 20)
+            spread = math.pi / 6
+            for sign in (-1, 1):
+                lx = self.x2 - head_len * math.cos(angle + sign * spread)
+                ly = self.y2 - head_len * math.sin(angle + sign * spread)
+                cr.move_to(self.x2, self.y2)
+                cr.line_to(lx, ly)
+                cr.stroke()
 
 
-# ─── Toolbar Button Definitions ──────────────────────────────────────────────
+# ─── Main Application ────────────────────────────────────────────────────────
 
-class ToolButton:
-    """Represents a clickable button in the toolbar."""
-
-    def __init__(self, name, icon_draw_func, x=0, y=0, w=40, h=40,
-                 is_active=False, tooltip="", has_submenu=False):
-        self.name = name
-        self.icon_draw_func = icon_draw_func
-        self.x = x
-        self.y = y
-        self.w = w
-        self.h = h
-        self.is_active = is_active
-        self.tooltip = tooltip
-        self.has_submenu = has_submenu
-        self.hover = False
-
-
-# ─── Main Application Window ─────────────────────────────────────────────────
-
-class ScreenDrawWindow(Gtk.Window):
+class ScreenDrawApp(Gtk.Application):
     def __init__(self):
-        super().__init__(title="Screen Draw")
+        super().__init__(
+            application_id="com.tools.screendraw",
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
+        )
+        self._dbus_service = None
+        self._window = None
+
+    def do_activate(self):
+        if self._window is None:
+            self._window = ScreenDrawWindow(application=self)
+            self._window.show_all()
+            GLib.idle_add(self._window._hide_overlay)
+            # Set up D-Bus service
+            self._dbus_service = ScreenDrawDBusService(self._window)
+            print("[\u2713] D-Bus service registered")
+        else:
+            # Already running, toggle overlay
+            self._window._toggle_overlay()
+
+
+class ScreenDrawWindow(Gtk.ApplicationWindow):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
         # ── Drawing state ──
-        self.strokes = []       # committed strokes
-        self.redo_stack = []    # undone strokes
+        self.strokes = []
+        self.redo_stack = []
         self.current_points = []
         self.is_drawing = False
         self.shape_start = None
@@ -210,27 +260,24 @@ class ScreenDrawWindow(Gtk.Window):
         # ── Tool state ──
         self.current_tool = TOOL_PEN
         self.current_color = "#FF3B30"
-        self.stroke_width = 4
+        self.stroke_width = 5
         self.is_visible = False
 
-        # ── Submenu state ──
-        self.submenu_open = None   # "pen_options" | "shapes" | None
-        self.submenu_buttons = []  # dynamic sub-buttons
+        # ── UI state ──
+        self.submenu_open = None   # "pen_options" | None
+        self.submenu_items = []
+        self.toolbar_buttons = []
+        self.hover_button = None
+        self.mouse_x = 0
+        self.mouse_y = 0
 
-        # ── Canvas surface (persistent drawing buffer) ──
+        # ── Canvas surface ──
         self.canvas_surface = None
 
-        # ── Setup the window ──
+        # ── Setup ──
         self._setup_window()
-        self._build_toolbar_buttons()
+        self._build_toolbar()
         self._connect_events()
-
-        # ── Register global hotkey ──
-        if HAS_KEYBINDER:
-            Keybinder.init()
-            Keybinder.bind(TOGGLE_KEY, self._on_global_toggle, None)
-
-    # ── Window Setup ──────────────────────────────────────────────────────
 
     def _setup_window(self):
         screen = Gdk.Screen.get_default()
@@ -244,39 +291,34 @@ class ScreenDrawWindow(Gtk.Window):
         self.set_skip_pager_hint(True)
         self.set_keep_above(True)
         self.set_accept_focus(True)
+        self.set_title("Screen Draw")
 
-        if HAS_LAYER_SHELL:
-            GtkLayerShell.init_for_window(self)
-            GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
-            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, True)
-            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
-            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.LEFT, True)
-            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
-            GtkLayerShell.set_exclusive_zone(self, -1)  # overlay mode
-            GtkLayerShell.set_keyboard_mode(
-                self, GtkLayerShell.KeyboardMode.ON_DEMAND
-            )
-        else:
-            # X11 fallback
-            monitor = screen.get_display().get_primary_monitor()
-            if monitor is None:
-                monitor = screen.get_display().get_monitor(0)
-            geom = monitor.get_geometry()
-            self.move(geom.x, geom.y)
-            self.set_default_size(geom.width, geom.height)
-            self.fullscreen()
-            self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        # Get monitor geometry
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor()
+        if monitor is None:
+            monitor = display.get_monitor(0)
+        geom = monitor.get_geometry()
+        self.mon_width = geom.width
+        self.mon_height = geom.height
 
-        # Enable input events
+        self.set_default_size(self.mon_width, self.mon_height)
+        self.move(geom.x, geom.y)
+        self.fullscreen()
+
+        # Window type
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+
+        # Input events
         self.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
             | Gdk.EventMask.POINTER_MOTION_MASK
             | Gdk.EventMask.KEY_PRESS_MASK
-            | Gdk.EventMask.POINTER_MOTION_HINT_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
         )
 
-    # ── Event Connections ─────────────────────────────────────────────────
+
 
     def _connect_events(self):
         self.connect("draw", self._on_draw)
@@ -287,545 +329,560 @@ class ScreenDrawWindow(Gtk.Window):
         self.connect("destroy", self._on_destroy)
         self.connect("configure-event", self._on_configure)
 
-    # ── Toolbar Button Definitions ────────────────────────────────────────
+    # ── Toolbar Definition ────────────────────────────────────────────────
 
-    def _build_toolbar_buttons(self):
+    def _build_toolbar(self):
+        """Define toolbar buttons with their icons and metadata."""
         self.toolbar_buttons = []
+        defs = [
+            ("pen",    "Pen (P)",       True),
+            ("eraser", "Eraser (E)",    False),
+            ("__sep",  "",              False),
+            ("line",   "Line (L)",      False),
+            ("rect",   "Rectangle (R)", False),
+            ("circle", "Circle (O)",    False),
+            ("arrow",  "Arrow (A)",     False),
+            ("__sep2", "",              False),
+            ("undo",   "Undo (Ctrl+Z)", False),
+            ("redo",   "Redo (Ctrl+Y)", False),
+            ("clear",  "Clear (Ctrl+X)",False),
+            ("__sep3", "",              False),
+            ("close",  "Hide (Esc)",    False),
+        ]
+        for name, tip, is_active in defs:
+            self.toolbar_buttons.append({
+                "name": name,
+                "tip": tip,
+                "active": is_active,
+                "x": 0, "y": 0,
+                "w": TOOLBAR_BTN_SIZE if not name.startswith("__sep") else 2,
+                "h": TOOLBAR_BTN_SIZE,
+            })
 
-        # Pen
-        btn_pen = ToolButton(
-            "pen", self._draw_pen_icon, tooltip="Pen (P)",
-            is_active=True, has_submenu=True
-        )
-        self.toolbar_buttons.append(btn_pen)
-
-        # Eraser
-        btn_eraser = ToolButton(
-            "eraser", self._draw_eraser_icon, tooltip="Eraser (E)"
-        )
-        self.toolbar_buttons.append(btn_eraser)
-
-        # Separator
-        btn_sep = ToolButton("sep", None, w=2, tooltip="")
-        self.toolbar_buttons.append(btn_sep)
-
-        # Line
-        btn_line = ToolButton(
-            "line", self._draw_line_icon, tooltip="Line (L)"
-        )
-        self.toolbar_buttons.append(btn_line)
-
-        # Rectangle
-        btn_rect = ToolButton(
-            "rect", self._draw_rect_icon, tooltip="Rectangle (R)"
-        )
-        self.toolbar_buttons.append(btn_rect)
-
-        # Circle
-        btn_circle = ToolButton(
-            "circle", self._draw_circle_icon, tooltip="Circle (C)"
-        )
-        self.toolbar_buttons.append(btn_circle)
-
-        # Arrow
-        btn_arrow = ToolButton(
-            "arrow", self._draw_arrow_icon, tooltip="Arrow (A)"
-        )
-        self.toolbar_buttons.append(btn_arrow)
-
-        # Separator
-        btn_sep2 = ToolButton("sep2", None, w=2, tooltip="")
-        self.toolbar_buttons.append(btn_sep2)
-
-        # Undo
-        btn_undo = ToolButton(
-            "undo", self._draw_undo_icon, tooltip="Undo (Ctrl+Z)"
-        )
-        self.toolbar_buttons.append(btn_undo)
-
-        # Redo
-        btn_redo = ToolButton(
-            "redo", self._draw_redo_icon, tooltip="Redo (Ctrl+Y)"
-        )
-        self.toolbar_buttons.append(btn_redo)
-
-        # Clear
-        btn_clear = ToolButton(
-            "clear", self._draw_clear_icon, tooltip="Clear All (Ctrl+C)"
-        )
-        self.toolbar_buttons.append(btn_clear)
-
-        # Close (hide)
-        btn_close = ToolButton(
-            "close", self._draw_close_icon, tooltip="Hide (Esc)"
-        )
-        self.toolbar_buttons.append(btn_close)
-
-    def _layout_toolbar_buttons(self, width):
-        """Position toolbar buttons centered at the top of the screen."""
-        btn_size = TOOLBAR_HEIGHT - TOOLBAR_PADDING * 2
+    def _layout_toolbar(self, width):
+        """Position toolbar buttons centered horizontally."""
         total_w = 0
-        for btn in self.toolbar_buttons:
-            if btn.name.startswith("sep"):
-                total_w += 2 + TOOLBAR_GAP
+        for b in self.toolbar_buttons:
+            if b["name"].startswith("__sep"):
+                total_w += 12
             else:
-                total_w += btn_size + TOOLBAR_GAP
-
+                total_w += TOOLBAR_BTN_SIZE + TOOLBAR_GAP
         start_x = (width - total_w) / 2
-        cur_x = start_x
-        for btn in self.toolbar_buttons:
-            if btn.name.startswith("sep"):
-                btn.x = cur_x
-                btn.y = TOOLBAR_PADDING + 4
-                btn.w = 2
-                btn.h = btn_size - 8
-                cur_x += 2 + TOOLBAR_GAP
+        cx = start_x
+        for b in self.toolbar_buttons:
+            if b["name"].startswith("__sep"):
+                b["x"] = cx + 4
+                b["y"] = TOOLBAR_PADDING + 8
+                b["w"] = 2
+                b["h"] = TOOLBAR_BTN_SIZE - 16
+                cx += 12
             else:
-                btn.x = cur_x
-                btn.y = TOOLBAR_PADDING
-                btn.w = btn_size
-                btn.h = btn_size
-                cur_x += btn_size + TOOLBAR_GAP
+                b["x"] = cx
+                b["y"] = TOOLBAR_PADDING
+                b["w"] = TOOLBAR_BTN_SIZE
+                b["h"] = TOOLBAR_BTN_SIZE
+                cx += TOOLBAR_BTN_SIZE + TOOLBAR_GAP
 
-    # ── Canvas Surface Management ─────────────────────────────────────────
+    # ── Canvas Management ─────────────────────────────────────────────────
 
-    def _ensure_canvas(self, width, height):
-        """Create or resize the persistent canvas surface."""
+    def _ensure_canvas(self, w, h):
         if (self.canvas_surface is None
-                or self.canvas_surface.get_width() != width
-                or self.canvas_surface.get_height() != height):
-            new_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
-            if self.canvas_surface is not None:
-                cr = cairo.Context(new_surface)
+                or self.canvas_surface.get_width() != w
+                or self.canvas_surface.get_height() != h):
+            new_s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+            if self.canvas_surface:
+                cr = cairo.Context(new_s)
                 cr.set_source_surface(self.canvas_surface, 0, 0)
                 cr.paint()
-            self.canvas_surface = new_surface
+            self.canvas_surface = new_s
 
-    def _redraw_canvas(self):
-        """Rebuild the canvas from strokes."""
+    def _rebuild_canvas(self):
         if self.canvas_surface is None:
             return
         w = self.canvas_surface.get_width()
         h = self.canvas_surface.get_height()
         self.canvas_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
         cr = cairo.Context(self.canvas_surface)
-        for stroke in self.strokes:
-            stroke.draw(cr)
+        for s in self.strokes:
+            s.draw(cr)
 
     def _on_configure(self, widget, event):
         self._ensure_canvas(event.width, event.height)
 
-    # ── Draw Handler ──────────────────────────────────────────────────────
+    # ── Main Draw ─────────────────────────────────────────────────────────
 
     def _on_draw(self, widget, cr):
         alloc = self.get_allocation()
-        width, height = alloc.width, alloc.height
+        w, h = alloc.width, alloc.height
+        self._ensure_canvas(w, h)
+        self._layout_toolbar(w)
 
-        self._ensure_canvas(width, height)
-        self._layout_toolbar_buttons(width)
-
-        # Clear the window (fully transparent)
+        # Clear to transparent
         cr.set_operator(cairo.OPERATOR_SOURCE)
         cr.set_source_rgba(0, 0, 0, 0)
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
 
-        # Semi-transparent overlay tint so user knows drawing mode is on
-        cr.set_source_rgba(0, 0, 0, 0.05)
+        # Very light tint so user knows overlay is active
+        cr.set_source_rgba(0, 0, 0, 0.03)
         cr.paint()
 
-        # Paint the committed strokes
+        # Paint committed strokes
         cr.set_source_surface(self.canvas_surface, 0, 0)
         cr.paint()
 
-        # Paint the in-progress stroke / shape
+        # Paint in-progress stroke
         if self.is_drawing:
-            if self.current_tool == TOOL_PEN and len(self.current_points) >= 2:
-                temp = FreehandStroke(
-                    self.current_points, self.current_color, self.stroke_width
-                )
-                temp.draw(cr)
-            elif self.current_tool == TOOL_ERASER and len(self.current_points) >= 2:
-                temp = FreehandStroke(
-                    self.current_points, "#000", self.stroke_width * 3, is_eraser=True
-                )
-                temp.draw(cr)
-            elif (self.current_tool in (TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW)
-                  and self.shape_start and self.shape_end):
-                temp = ShapeStroke(
-                    self.current_tool,
-                    *self.shape_start, *self.shape_end,
-                    self.current_color, self.stroke_width
-                )
-                temp.draw(cr)
+            self._draw_current_stroke(cr)
 
-        # ── Draw Toolbar ──
-        self._draw_toolbar(cr, width)
+        # Eraser cursor circle
+        if self.current_tool == TOOL_ERASER and not self.is_drawing:
+            cr.set_source_rgba(1, 1, 1, 0.5)
+            cr.set_line_width(1.5)
+            cr.arc(self.mouse_x, self.mouse_y,
+                   self.stroke_width * 1.5, 0, 2 * math.pi)
+            cr.stroke()
 
-        # ── Draw Submenu ──
+        # Toolbar
+        self._draw_toolbar(cr, w)
+
+        # Submenu
         if self.submenu_open == "pen_options":
-            self._draw_pen_options_submenu(cr, width)
+            self._draw_pen_submenu(cr, w)
 
-    # ── Toolbar Drawing ───────────────────────────────────────────────────
+    def _draw_current_stroke(self, cr):
+        """Render the stroke currently being drawn."""
+        if self.current_tool == TOOL_PEN and len(self.current_points) >= 2:
+            FreehandStroke(
+                self.current_points, self.current_color, self.stroke_width
+            ).draw(cr)
+
+        elif self.current_tool == TOOL_ERASER and len(self.current_points) >= 2:
+            FreehandStroke(
+                self.current_points, "#000", self.stroke_width * 3,
+                is_eraser=True
+            ).draw(cr)
+
+        elif (self.current_tool in (TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW)
+              and self.shape_start and self.shape_end):
+            ShapeStroke(
+                self.current_tool,
+                *self.shape_start, *self.shape_end,
+                self.current_color, self.stroke_width
+            ).draw(cr)
+
+    # ── Toolbar Rendering ─────────────────────────────────────────────────
 
     def _draw_toolbar(self, cr, width):
-        """Draw the floating toolbar at the top-center."""
-        # Background pill
-        total_w = 0
-        for btn in self.toolbar_buttons:
-            total_w += btn.w + TOOLBAR_GAP
-        bar_x = (width - total_w) / 2 - 12
-        bar_w = total_w + 24
+        # Compute bar dimensions
+        first = None
+        last = None
+        for b in self.toolbar_buttons:
+            if not b["name"].startswith("__sep"):
+                if first is None:
+                    first = b
+                last = b
+
+        if not first or not last:
+            return
+
+        bar_x = first["x"] - 10
+        bar_w = (last["x"] + last["w"]) - first["x"] + 20
         bar_y = 0
         bar_h = TOOLBAR_HEIGHT
 
-        # Rounded rect background
-        r = TOOLBAR_RADIUS
-        cr.new_sub_path()
-        cr.arc(bar_x + bar_w - r, bar_y + r, r, -math.pi / 2, 0)
-        cr.arc(bar_x + bar_w - r, bar_y + bar_h - r, r, 0, math.pi / 2)
-        cr.arc(bar_x + r, bar_y + bar_h - r, r, math.pi / 2, math.pi)
-        cr.arc(bar_x + r, bar_y + r, r, math.pi, 3 * math.pi / 2)
-        cr.close_path()
-        cr.set_source_rgba(0.12, 0.12, 0.14, 0.92)
-        cr.fill()
-
-        # Subtle border
-        cr.new_sub_path()
-        cr.arc(bar_x + bar_w - r, bar_y + r, r, -math.pi / 2, 0)
-        cr.arc(bar_x + bar_w - r, bar_y + bar_h - r, r, 0, math.pi / 2)
-        cr.arc(bar_x + r, bar_y + bar_h - r, r, math.pi / 2, math.pi)
-        cr.arc(bar_x + r, bar_y + r, r, math.pi, 3 * math.pi / 2)
-        cr.close_path()
-        cr.set_source_rgba(1, 1, 1, 0.1)
-        cr.set_line_width(1)
-        cr.stroke()
-
-        # Buttons
-        for btn in self.toolbar_buttons:
-            if btn.name.startswith("sep"):
-                cr.set_source_rgba(1, 1, 1, 0.15)
-                cr.rectangle(btn.x, btn.y, btn.w, btn.h)
-                cr.fill()
-                continue
-
-            # Button background
-            is_tool_btn = btn.name in (
-                TOOL_PEN, TOOL_ERASER, TOOL_LINE, TOOL_RECT,
-                TOOL_CIRCLE, TOOL_ARROW
-            )
-            is_active = is_tool_btn and self.current_tool == btn.name
-            if is_active:
-                # Active glow
-                self._rounded_rect(cr, btn.x, btn.y, btn.w, btn.h, 8)
-                cr.set_source_rgba(1, 1, 1, 0.18)
-                cr.fill()
-            elif btn.hover:
-                self._rounded_rect(cr, btn.x, btn.y, btn.w, btn.h, 8)
-                cr.set_source_rgba(1, 1, 1, 0.08)
-                cr.fill()
-
-            # Draw icon
-            if btn.icon_draw_func:
-                cr.save()
-                btn.icon_draw_func(cr, btn.x, btn.y, btn.w, btn.h, is_active)
-                cr.restore()
-
-            # Active dot indicator
-            if is_active:
-                cr.arc(btn.x + btn.w / 2, btn.y + btn.h - 1, 2, 0, 2 * math.pi)
-                r, g, b, _ = hex_to_rgba(self.current_color)
-                cr.set_source_rgba(r, g, b, 1)
-                cr.fill()
-
-    def _rounded_rect(self, cr, x, y, w, h, r):
-        cr.new_sub_path()
-        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
-        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
-        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
-        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
-        cr.close_path()
-
-    # ── Pen Options Submenu ───────────────────────────────────────────────
-
-    def _draw_pen_options_submenu(self, cr, width):
-        """Draw a submenu below the pen button for color & stroke selection."""
-        pen_btn = None
-        for btn in self.toolbar_buttons:
-            if btn.name == "pen":
-                pen_btn = btn
-                break
-        if not pen_btn:
-            return
-
-        # Submenu dimensions
-        sm_w = 280
-        sm_h = 120
-        sm_x = pen_btn.x + pen_btn.w / 2 - sm_w / 2
-        sm_y = TOOLBAR_HEIGHT + 8
-
-        # Clamp to screen
-        if sm_x < 8:
-            sm_x = 8
+        # Shadow
+        cr.save()
+        for i in range(6):
+            rounded_rect(cr, bar_x - i, bar_y - i, bar_w + 2 * i, bar_h + 2 * i, TOOLBAR_RADIUS + i)
+            cr.set_source_rgba(0, 0, 0, 0.03)
+            cr.fill()
+        cr.restore()
 
         # Background
-        r = 12
-        self._rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, r)
-        cr.set_source_rgba(0.14, 0.14, 0.16, 0.94)
+        rounded_rect(cr, bar_x, bar_y, bar_w, bar_h, TOOLBAR_RADIUS)
+        # Gradient
+        grad = cairo.LinearGradient(bar_x, bar_y, bar_x, bar_y + bar_h)
+        grad.add_color_stop_rgba(0, 0.16, 0.16, 0.18, 0.95)
+        grad.add_color_stop_rgba(1, 0.10, 0.10, 0.12, 0.95)
+        cr.set_source(grad)
         cr.fill()
-        self._rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, r)
+
+        # Border
+        rounded_rect(cr, bar_x, bar_y, bar_w, bar_h, TOOLBAR_RADIUS)
         cr.set_source_rgba(1, 1, 1, 0.08)
         cr.set_line_width(1)
         cr.stroke()
 
-        # ── Color swatches ──
-        self.submenu_buttons = []
-        swatch_size = 22
-        swatch_gap = 6
-        row_y = sm_y + 14
-        start_x = sm_x + 14
+        # Buttons
+        tool_names = {TOOL_PEN, TOOL_ERASER, TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
+        for b in self.toolbar_buttons:
+            name = b["name"]
+            if name.startswith("__sep"):
+                # Separator
+                cr.set_source_rgba(1, 1, 1, 0.1)
+                cr.rectangle(b["x"], b["y"], b["w"], b["h"])
+                cr.fill()
+                continue
 
-        cr.set_source_rgba(1, 1, 1, 0.5)
-        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-        cr.set_font_size(11)
-        cr.move_to(start_x, row_y)
-        cr.show_text("COLOR")
-        row_y += 10
+            bx, by, bw, bh = b["x"], b["y"], b["w"], b["h"]
+            is_active = name in tool_names and self.current_tool == name
+            is_hover = (self.hover_button == name)
 
-        for i, (hex_c, name) in enumerate(COLOR_PRESETS):
-            sx = start_x + i * (swatch_size + swatch_gap)
-            sy = row_y
+            # Button background
+            if is_active:
+                rounded_rect(cr, bx + 2, by + 2, bw - 4, bh - 4, 8)
+                r, g, bc, _ = hex_to_rgba(self.current_color, 0.25)
+                cr.set_source_rgba(r, g, bc, 0.25)
+                cr.fill()
+            elif is_hover:
+                rounded_rect(cr, bx + 2, by + 2, bw - 4, bh - 4, 8)
+                cr.set_source_rgba(1, 1, 1, 0.08)
+                cr.fill()
 
-            # Draw swatch
-            rc, gc, bc, _ = hex_to_rgba(hex_c)
-            cr.arc(sx + swatch_size / 2, sy + swatch_size / 2, swatch_size / 2, 0, 2 * math.pi)
+            # Icon
+            self._draw_button_icon(cr, name, bx, by, bw, bh, is_active)
+
+            # Active indicator dot
+            if is_active:
+                cr.arc(bx + bw / 2, by + bh - 2, 2.5, 0, 2 * math.pi)
+                rc, gc, bcc, _ = hex_to_rgba(self.current_color)
+                cr.set_source_rgba(rc, gc, bcc, 1)
+                cr.fill()
+
+    def _draw_button_icon(self, cr, name, x, y, w, h, active):
+        """Draw the icon for a specific toolbar button."""
+        alpha = 0.95 if active else 0.65
+        cr.set_line_width(2)
+        cx, cy = x + w / 2, y + h / 2
+
+        if name == "pen":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            # Pen body (angled rectangle)
+            cr.save()
+            cr.translate(cx, cy)
+            cr.rotate(-math.pi / 4)
+            cr.rectangle(-3, -12, 6, 18)
+            cr.stroke()
+            # Tip
+            cr.move_to(-3, 6)
+            cr.line_to(0, 11)
+            cr.line_to(3, 6)
+            cr.stroke()
+            cr.restore()
+            # Color dot
+            rc, gc, bc, _ = hex_to_rgba(self.current_color)
+            cr.arc(x + w - 8, y + h - 8, 5, 0, 2 * math.pi)
             cr.set_source_rgba(rc, gc, bc, 1)
             cr.fill()
+            cr.set_source_rgba(1, 1, 1, 0.5)
+            cr.arc(x + w - 8, y + h - 8, 5, 0, 2 * math.pi)
+            cr.set_line_width(1)
+            cr.stroke()
+
+        elif name == "eraser":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            # Eraser rectangle
+            cr.save()
+            cr.translate(cx, cy)
+            cr.rotate(-math.pi / 6)
+            rounded_rect(cr, -12, -6, 24, 12, 3)
+            cr.stroke()
+            # Divider line
+            cr.move_to(-4, -6)
+            cr.line_to(-4, 6)
+            cr.stroke()
+            cr.restore()
+
+        elif name == "line":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            cr.move_to(x + 10, y + h - 10)
+            cr.line_to(x + w - 10, y + 10)
+            cr.stroke()
+
+        elif name == "rect":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            rounded_rect(cr, x + 9, y + 11, w - 18, h - 22, 2)
+            cr.stroke()
+
+        elif name == "circle":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            cr.arc(cx, cy, min(w, h) / 2 - 9, 0, 2 * math.pi)
+            cr.stroke()
+
+        elif name == "arrow":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            sx, sy = x + 10, y + h - 10
+            ex, ey = x + w - 10, y + 10
+            cr.move_to(sx, sy)
+            cr.line_to(ex, ey)
+            cr.stroke()
+            # Arrowhead
+            angle = math.atan2(ey - sy, ex - sx)
+            hl = 10
+            for sign in (-1, 1):
+                cr.move_to(ex, ey)
+                cr.line_to(
+                    ex - hl * math.cos(angle + sign * math.pi / 5),
+                    ey - hl * math.sin(angle + sign * math.pi / 5),
+                )
+                cr.stroke()
+
+        elif name == "undo":
+            cr.set_source_rgba(1, 1, 1, 0.65)
+            # Curved arrow pointing left
+            cr.arc(cx + 2, cy, 8, math.pi * 0.7, math.pi * 2.3)
+            cr.stroke()
+            px = cx + 2 + 8 * math.cos(math.pi * 0.7)
+            py = cy + 8 * math.sin(math.pi * 0.7)
+            cr.move_to(px, py)
+            cr.line_to(px - 5, py - 1)
+            cr.move_to(px, py)
+            cr.line_to(px + 1, py - 6)
+            cr.stroke()
+
+        elif name == "redo":
+            cr.set_source_rgba(1, 1, 1, 0.65)
+            cr.arc_negative(cx - 2, cy, 8, math.pi * 0.3, -math.pi * 1.3)
+            cr.stroke()
+            px = cx - 2 + 8 * math.cos(math.pi * 0.3)
+            py = cy + 8 * math.sin(math.pi * 0.3)
+            cr.move_to(px, py)
+            cr.line_to(px + 5, py - 1)
+            cr.move_to(px, py)
+            cr.line_to(px - 1, py - 6)
+            cr.stroke()
+
+        elif name == "clear":
+            cr.set_source_rgba(1, 0.35, 0.35, 0.8)
+            # Trash icon
+            cr.set_line_width(1.8)
+            # Can body
+            rounded_rect(cr, cx - 7, cy - 2, 14, 13, 2)
+            cr.stroke()
+            # Lid
+            cr.move_to(cx - 9, cy - 2)
+            cr.line_to(cx + 9, cy - 2)
+            cr.stroke()
+            # Handle
+            cr.move_to(cx - 3, cy - 2)
+            cr.line_to(cx - 2, cy - 5)
+            cr.line_to(cx + 2, cy - 5)
+            cr.line_to(cx + 3, cy - 2)
+            cr.stroke()
+            # Lines
+            for dx in (-3, 0, 3):
+                cr.move_to(cx + dx, cy + 1)
+                cr.line_to(cx + dx, cy + 8)
+                cr.stroke()
+
+        elif name == "close":
+            cr.set_source_rgba(1, 1, 1, 0.65)
+            cr.set_line_width(2.5)
+            d = 7
+            cr.move_to(cx - d, cy - d)
+            cr.line_to(cx + d, cy + d)
+            cr.move_to(cx + d, cy - d)
+            cr.line_to(cx - d, cy + d)
+            cr.stroke()
+
+    # ── Pen Options Submenu ───────────────────────────────────────────────
+
+    def _draw_pen_submenu(self, cr, width):
+        """Draw color and stroke width picker below the pen button."""
+        pen_btn = None
+        for b in self.toolbar_buttons:
+            if b["name"] == "pen":
+                pen_btn = b
+                break
+        if not pen_btn:
+            return
+
+        # Calculate submenu size
+        n_colors = len(COLOR_PRESETS)
+        color_row_w = n_colors * (SM_COLOR_SWATCH + SM_COLOR_GAP) - SM_COLOR_GAP
+        n_strokes = len(STROKE_PRESETS)
+        stroke_row_w = n_strokes * (SM_STROKE_PILL_W + 4) - 4
+
+        sm_content_w = max(color_row_w, stroke_row_w)
+        sm_w = sm_content_w + 32
+        sm_h = 108
+        sm_x = pen_btn["x"] + pen_btn["w"] / 2 - sm_w / 2
+        sm_y = TOOLBAR_HEIGHT + 10
+
+        # Clamp
+        sm_x = max(8, min(sm_x, width - sm_w - 8))
+
+        # Shadow
+        for i in range(5):
+            rounded_rect(cr, sm_x - i, sm_y - i, sm_w + 2 * i, sm_h + 2 * i, 14 + i)
+            cr.set_source_rgba(0, 0, 0, 0.04)
+            cr.fill()
+
+        # Background
+        rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, 14)
+        grad = cairo.LinearGradient(sm_x, sm_y, sm_x, sm_y + sm_h)
+        grad.add_color_stop_rgba(0, 0.18, 0.18, 0.20, 0.96)
+        grad.add_color_stop_rgba(1, 0.12, 0.12, 0.14, 0.96)
+        cr.set_source(grad)
+        cr.fill()
+
+        # Border
+        rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, 14)
+        cr.set_source_rgba(1, 1, 1, 0.06)
+        cr.set_line_width(1)
+        cr.stroke()
+
+        # Pointer triangle
+        tri_cx = pen_btn["x"] + pen_btn["w"] / 2
+        tri_cy = sm_y
+        cr.move_to(tri_cx - 8, tri_cy)
+        cr.line_to(tri_cx, tri_cy - 6)
+        cr.line_to(tri_cx + 8, tri_cy)
+        cr.close_path()
+        cr.set_source_rgba(0.18, 0.18, 0.20, 0.96)
+        cr.fill()
+
+        self.submenu_items = []
+        pad_x = sm_x + 16
+        cur_y = sm_y + 14
+
+        # Label: COLOR
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10)
+        cr.move_to(pad_x, cur_y)
+        cr.show_text("COLOR")
+        cur_y += 8
+
+        # Color swatches
+        for i, (hex_c, _name) in enumerate(COLOR_PRESETS):
+            sx = pad_x + i * (SM_COLOR_SWATCH + SM_COLOR_GAP)
+            sy = cur_y
+            rc, gc, bc, _ = hex_to_rgba(hex_c)
 
             # Selection ring
             if hex_c == self.current_color:
-                cr.arc(sx + swatch_size / 2, sy + swatch_size / 2,
-                       swatch_size / 2 + 3, 0, 2 * math.pi)
-                cr.set_source_rgba(1, 1, 1, 0.8)
+                cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                       SM_COLOR_SWATCH / 2 + 3, 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.7)
                 cr.set_line_width(2)
                 cr.stroke()
 
-            self.submenu_buttons.append({
-                "type": "color",
-                "value": hex_c,
-                "x": sx, "y": sy, "w": swatch_size, "h": swatch_size,
+            # Swatch circle
+            cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                   SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
+            cr.set_source_rgba(rc, gc, bc, 1)
+            cr.fill()
+
+            # Border for light colors
+            if hex_c in ("#FFFFFF", "#FFCC00"):
+                cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                       SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.2)
+                cr.set_line_width(1)
+                cr.stroke()
+
+            self.submenu_items.append({
+                "type": "color", "value": hex_c,
+                "x": sx, "y": sy,
+                "w": SM_COLOR_SWATCH, "h": SM_COLOR_SWATCH,
             })
 
-        # ── Stroke width ──
-        row_y += swatch_size + 16
-        cr.set_source_rgba(1, 1, 1, 0.5)
-        cr.set_font_size(11)
-        cr.move_to(start_x, row_y)
-        cr.show_text("STROKE")
-        row_y += 10
+        cur_y += SM_COLOR_SWATCH + 14
 
+        # Label: STROKE
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.set_font_size(10)
+        cr.move_to(pad_x, cur_y)
+        cr.show_text("STROKE")
+        cur_y += 8
+
+        # Stroke width pills
         for i, sw in enumerate(STROKE_PRESETS):
-            sx = start_x + i * 36
-            sy = row_y
-            dot_r = max(sw / 2, 2)
-            # Background pill
-            if self.stroke_width == sw:
-                self._rounded_rect(cr, sx - 2, sy - 2, 30, 22, 6)
+            sx = pad_x + i * (SM_STROKE_PILL_W + 4)
+            sy = cur_y
+            is_sel = self.stroke_width == sw
+
+            # Pill background
+            rounded_rect(cr, sx, sy, SM_STROKE_PILL_W, SM_STROKE_PILL_H, 6)
+            if is_sel:
+                rc, gc, bc, _ = hex_to_rgba(self.current_color, 0.3)
+                cr.set_source_rgba(rc, gc, bc, 0.3)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.06)
+            cr.fill()
+
+            if is_sel:
+                rounded_rect(cr, sx, sy, SM_STROKE_PILL_W, SM_STROKE_PILL_H, 6)
                 cr.set_source_rgba(1, 1, 1, 0.15)
-                cr.fill()
-            # Dot
-            cr.arc(sx + 13, sy + 9, dot_r, 0, 2 * math.pi)
+                cr.set_line_width(1)
+                cr.stroke()
+
+            # Dot proportional to stroke width
+            dot_r = max(sw / 2.5, 1.5)
+            cr.arc(sx + SM_STROKE_PILL_W / 2, sy + SM_STROKE_PILL_H / 2,
+                   dot_r, 0, 2 * math.pi)
             cr.set_source_rgba(1, 1, 1, 0.85)
             cr.fill()
 
-            self.submenu_buttons.append({
-                "type": "stroke",
-                "value": sw,
-                "x": sx - 2, "y": sy - 2, "w": 30, "h": 22,
+            self.submenu_items.append({
+                "type": "stroke", "value": sw,
+                "x": sx, "y": sy,
+                "w": SM_STROKE_PILL_W, "h": SM_STROKE_PILL_H,
             })
-
-    # ── Icon Drawing Functions ────────────────────────────────────────────
-
-    def _draw_pen_icon(self, cr, x, y, w, h, active):
-        """Draw a pen/pencil icon."""
-        cr.set_source_rgba(1, 1, 1, 0.9 if active else 0.65)
-        cr.set_line_width(2)
-        cx, cy = x + w / 2, y + h / 2
-        # Pen body
-        cr.move_to(cx - 8, cy + 10)
-        cr.line_to(cx + 6, cy - 6)
-        cr.line_to(cx + 10, cy - 2)
-        cr.line_to(cx - 4, cy + 14)
-        cr.close_path()
-        cr.stroke()
-        # Tip
-        cr.move_to(cx - 8, cy + 10)
-        cr.line_to(cx - 10, cy + 14)
-        cr.line_to(cx - 4, cy + 14)
-        cr.stroke()
-        # Current color indicator dot
-        rc, gc, bc, _ = hex_to_rgba(self.current_color)
-        cr.arc(cx + 10, cy + 10, 4, 0, 2 * math.pi)
-        cr.set_source_rgba(rc, gc, bc, 1)
-        cr.fill()
-
-    def _draw_eraser_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.9 if active else 0.65)
-        cr.set_line_width(2)
-        cx, cy = x + w / 2, y + h / 2
-        # Eraser block
-        cr.rectangle(cx - 10, cy - 5, 20, 14)
-        cr.stroke()
-        # Eraser stripe
-        cr.move_to(cx - 10, cy + 3)
-        cr.line_to(cx + 10, cy + 3)
-        cr.stroke()
-
-    def _draw_line_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.9 if active else 0.65)
-        cr.set_line_width(2)
-        cr.move_to(x + 10, y + h - 10)
-        cr.line_to(x + w - 10, y + 10)
-        cr.stroke()
-
-    def _draw_rect_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.9 if active else 0.65)
-        cr.set_line_width(2)
-        cr.rectangle(x + 8, y + 10, w - 16, h - 20)
-        cr.stroke()
-
-    def _draw_circle_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.9 if active else 0.65)
-        cr.set_line_width(2)
-        cr.arc(x + w / 2, y + h / 2, min(w, h) / 2 - 8, 0, 2 * math.pi)
-        cr.stroke()
-
-    def _draw_arrow_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.9 if active else 0.65)
-        cr.set_line_width(2)
-        sx, sy = x + 10, y + h - 10
-        ex, ey = x + w - 10, y + 10
-        cr.move_to(sx, sy)
-        cr.line_to(ex, ey)
-        cr.stroke()
-        # Arrowhead
-        cr.move_to(ex, ey)
-        cr.line_to(ex - 8, ey + 2)
-        cr.move_to(ex, ey)
-        cr.line_to(ex - 2, ey + 8)
-        cr.stroke()
-
-    def _draw_undo_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.65)
-        cr.set_line_width(2)
-        cx, cy = x + w / 2, y + h / 2
-        cr.arc(cx, cy, 8, math.pi * 0.8, math.pi * 2.2)
-        cr.stroke()
-        # Arrow tip
-        px = cx + 8 * math.cos(math.pi * 0.8)
-        py = cy + 8 * math.sin(math.pi * 0.8)
-        cr.move_to(px, py)
-        cr.line_to(px - 5, py - 2)
-        cr.move_to(px, py)
-        cr.line_to(px + 1, py - 6)
-        cr.stroke()
-
-    def _draw_redo_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.65)
-        cr.set_line_width(2)
-        cx, cy = x + w / 2, y + h / 2
-        cr.arc_negative(cx, cy, 8, math.pi * 0.2, -math.pi * 1.2)
-        cr.stroke()
-        px = cx + 8 * math.cos(math.pi * 0.2)
-        py = cy + 8 * math.sin(math.pi * 0.2)
-        cr.move_to(px, py)
-        cr.line_to(px + 5, py - 2)
-        cr.move_to(px, py)
-        cr.line_to(px - 1, py - 6)
-        cr.stroke()
-
-    def _draw_clear_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 0.3, 0.3, 0.75)
-        cr.set_line_width(2)
-        cx, cy = x + w / 2, y + h / 2
-        # Trash can
-        cr.rectangle(cx - 7, cy - 3, 14, 14)
-        cr.stroke()
-        cr.move_to(cx - 10, cy - 3)
-        cr.line_to(cx + 10, cy - 3)
-        cr.stroke()
-        cr.move_to(cx - 3, cy - 3)
-        cr.line_to(cx - 2, cy - 7)
-        cr.line_to(cx + 2, cy - 7)
-        cr.line_to(cx + 3, cy - 3)
-        cr.stroke()
-
-    def _draw_close_icon(self, cr, x, y, w, h, active):
-        cr.set_source_rgba(1, 1, 1, 0.65)
-        cr.set_line_width(2.5)
-        cx, cy = x + w / 2, y + h / 2
-        d = 7
-        cr.move_to(cx - d, cy - d)
-        cr.line_to(cx + d, cy + d)
-        cr.move_to(cx + d, cy - d)
-        cr.line_to(cx - d, cy + d)
-        cr.stroke()
 
     # ── Hit Testing ───────────────────────────────────────────────────────
 
-    def _toolbar_hit_test(self, x, y):
-        """Return the ToolButton under (x, y), or None."""
-        for btn in self.toolbar_buttons:
-            if btn.name.startswith("sep"):
+    def _hit_toolbar(self, x, y):
+        for b in self.toolbar_buttons:
+            if b["name"].startswith("__sep"):
                 continue
-            if (btn.x <= x <= btn.x + btn.w
-                    and btn.y <= y <= btn.y + btn.h):
-                return btn
+            if (b["x"] <= x <= b["x"] + b["w"]
+                    and b["y"] <= y <= b["y"] + b["h"]):
+                return b
         return None
 
-    def _submenu_hit_test(self, x, y):
-        """Return the submenu item dict under (x, y), or None."""
-        for item in self.submenu_buttons:
+    def _hit_submenu(self, x, y):
+        for item in self.submenu_items:
             if (item["x"] <= x <= item["x"] + item["w"]
                     and item["y"] <= y <= item["y"] + item["h"]):
                 return item
         return None
 
-    def _is_in_toolbar_area(self, y):
+    def _in_toolbar_zone(self, y):
         return y <= TOOLBAR_HEIGHT
 
-    def _is_in_submenu_area(self, x, y):
-        if self.submenu_open is None:
+    def _in_submenu_zone(self, x, y):
+        if not self.submenu_open:
             return False
-        # Approximate submenu area
-        return TOOLBAR_HEIGHT < y < TOOLBAR_HEIGHT + 140
+        return TOOLBAR_HEIGHT < y < TOOLBAR_HEIGHT + 130
 
-    # ── Input Handlers ────────────────────────────────────────────────────
+    # ── Input Events ──────────────────────────────────────────────────────
 
     def _on_button_press(self, widget, event):
         if event.button != 1:
             return
-
         x, y = event.x, event.y
 
-        # Check toolbar
-        if self._is_in_toolbar_area(y):
-            btn = self._toolbar_hit_test(x, y)
+        # Toolbar
+        if self._in_toolbar_zone(y):
+            btn = self._hit_toolbar(x, y)
             if btn:
-                self._handle_toolbar_click(btn)
+                self._handle_toolbar_click(btn["name"])
             return
 
-        # Check submenu
-        if self._is_in_submenu_area(x, y):
-            item = self._submenu_hit_test(x, y)
+        # Submenu
+        if self._in_submenu_zone(x, y):
+            item = self._hit_submenu(x, y)
             if item:
                 self._handle_submenu_click(item)
             return
 
-        # Close submenu if open and clicked outside
+        # Close submenu
         if self.submenu_open:
             self.submenu_open = None
-            self.submenu_buttons = []
+            self.submenu_items = []
             self.queue_draw()
             return
 
@@ -833,35 +890,27 @@ class ScreenDrawWindow(Gtk.Window):
         self.is_drawing = True
         if self.current_tool in (TOOL_PEN, TOOL_ERASER):
             self.current_points = [(x, y)]
-        elif self.current_tool in (TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW):
+        else:
             self.shape_start = (x, y)
             self.shape_end = (x, y)
 
     def _on_button_release(self, widget, event):
         if event.button != 1 or not self.is_drawing:
             return
-
-        x, y = event.x, event.y
         self.is_drawing = False
 
         if self.current_tool == TOOL_PEN and len(self.current_points) >= 2:
             stroke = FreehandStroke(
                 list(self.current_points), self.current_color, self.stroke_width
             )
-            self.strokes.append(stroke)
-            self.redo_stack.clear()
-            # Commit to canvas
-            cr = cairo.Context(self.canvas_surface)
-            stroke.draw(cr)
+            self._commit_stroke(stroke)
 
         elif self.current_tool == TOOL_ERASER and len(self.current_points) >= 2:
             stroke = FreehandStroke(
-                list(self.current_points), "#000", self.stroke_width * 3, is_eraser=True
+                list(self.current_points), "#000", self.stroke_width * 3,
+                is_eraser=True
             )
-            self.strokes.append(stroke)
-            self.redo_stack.clear()
-            cr = cairo.Context(self.canvas_surface)
-            stroke.draw(cr)
+            self._commit_stroke(stroke)
 
         elif (self.current_tool in (TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW)
               and self.shape_start and self.shape_end):
@@ -870,36 +919,52 @@ class ScreenDrawWindow(Gtk.Window):
                 *self.shape_start, *self.shape_end,
                 self.current_color, self.stroke_width
             )
-            self.strokes.append(stroke)
-            self.redo_stack.clear()
-            cr = cairo.Context(self.canvas_surface)
-            stroke.draw(cr)
+            self._commit_stroke(stroke)
 
         self.current_points = []
         self.shape_start = None
         self.shape_end = None
         self.queue_draw()
 
+    def _commit_stroke(self, stroke):
+        self.strokes.append(stroke)
+        self.redo_stack.clear()
+        cr = cairo.Context(self.canvas_surface)
+        stroke.draw(cr)
+
     def _on_motion(self, widget, event):
         x, y = event.x, event.y
-
-        # Update hover states for toolbar
+        self.mouse_x = x
+        self.mouse_y = y
         needs_redraw = False
-        for btn in self.toolbar_buttons:
-            if btn.name.startswith("sep"):
-                continue
-            was_hover = btn.hover
-            btn.hover = (btn.x <= x <= btn.x + btn.w
-                         and btn.y <= y <= btn.y + btn.h)
-            if btn.hover != was_hover:
-                needs_redraw = True
+
+        # Hover
+        old_hover = self.hover_button
+        hit = self._hit_toolbar(x, y) if self._in_toolbar_zone(y) else None
+        self.hover_button = hit["name"] if hit else None
+        if self.hover_button != old_hover:
+            needs_redraw = True
+
+        # Update cursor
+        window = self.get_window()
+        if window:
+            if self._in_toolbar_zone(y) or self._in_submenu_zone(x, y):
+                cursor = Gdk.Cursor.new_from_name(self.get_display(), "default")
+            elif self.current_tool == TOOL_ERASER:
+                cursor = Gdk.Cursor.new_from_name(self.get_display(), "cell")
+            else:
+                cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
+            window.set_cursor(cursor)
 
         if self.is_drawing:
             if self.current_tool in (TOOL_PEN, TOOL_ERASER):
                 self.current_points.append((x, y))
-            elif self.current_tool in (TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW):
+            else:
                 self.shape_end = (x, y)
             needs_redraw = True
+
+        if self.current_tool == TOOL_ERASER:
+            needs_redraw = True  # need to redraw cursor circle
 
         if needs_redraw:
             self.queue_draw()
@@ -907,8 +972,7 @@ class ScreenDrawWindow(Gtk.Window):
     def _on_key_press(self, widget, event):
         keyval = event.keyval
         state = event.state
-        ctrl = state & Gdk.ModifierType.CONTROL_MASK
-
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         keyname = Gdk.keyval_name(keyval)
 
         if keyname == TOGGLE_KEY:
@@ -919,47 +983,41 @@ class ScreenDrawWindow(Gtk.Window):
             self._undo()
         elif ctrl and keyname in ("y", "Y"):
             self._redo()
-        elif ctrl and keyname in ("c", "C"):
+        elif ctrl and keyname in ("x", "X"):
             self._clear_canvas()
-        elif keyname in ("p", "P"):
+        elif not ctrl and keyname in ("p", "P"):
             self._select_tool(TOOL_PEN)
-        elif keyname in ("e", "E"):
+        elif not ctrl and keyname in ("e", "E"):
             self._select_tool(TOOL_ERASER)
-        elif keyname in ("l", "L"):
+        elif not ctrl and keyname in ("l", "L"):
             self._select_tool(TOOL_LINE)
-        elif keyname in ("r", "R"):
+        elif not ctrl and keyname in ("r", "R"):
             self._select_tool(TOOL_RECT)
-        elif keyname in ("c", "C") and not ctrl:
+        elif not ctrl and keyname in ("o", "O"):
             self._select_tool(TOOL_CIRCLE)
-        elif keyname in ("a", "A"):
+        elif not ctrl and keyname in ("a", "A"):
             self._select_tool(TOOL_ARROW)
 
-    # ── Toolbar Actions ───────────────────────────────────────────────────
+    # ── Actions ───────────────────────────────────────────────────────────
 
-    def _handle_toolbar_click(self, btn):
-        if btn.name == "pen":
+    def _handle_toolbar_click(self, name):
+        tool_names = {TOOL_PEN, TOOL_ERASER, TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
+
+        if name == "pen":
             self._select_tool(TOOL_PEN)
-            # Toggle pen options submenu
-            if self.submenu_open == "pen_options":
-                self.submenu_open = None
-                self.submenu_buttons = []
-            else:
-                self.submenu_open = "pen_options"
-        elif btn.name == "eraser":
-            self._select_tool(TOOL_ERASER)
+            self.submenu_open = "pen_options" if self.submenu_open != "pen_options" else None
+            self.submenu_items = []
+        elif name in tool_names:
+            self._select_tool(name)
             self.submenu_open = None
-            self.submenu_buttons = []
-        elif btn.name in (TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW):
-            self._select_tool(btn.name)
-            self.submenu_open = None
-            self.submenu_buttons = []
-        elif btn.name == "undo":
+            self.submenu_items = []
+        elif name == "undo":
             self._undo()
-        elif btn.name == "redo":
+        elif name == "redo":
             self._redo()
-        elif btn.name == "clear":
+        elif name == "clear":
             self._clear_canvas()
-        elif btn.name == "close":
+        elif name == "close":
             self._hide_overlay()
         self.queue_draw()
 
@@ -972,15 +1030,15 @@ class ScreenDrawWindow(Gtk.Window):
 
     def _select_tool(self, tool):
         self.current_tool = tool
+        if tool != TOOL_PEN:
+            self.submenu_open = None
+            self.submenu_items = []
         self.queue_draw()
-
-    # ── Canvas Actions ────────────────────────────────────────────────────
 
     def _undo(self):
         if self.strokes:
-            stroke = self.strokes.pop()
-            self.redo_stack.append(stroke)
-            self._redraw_canvas()
+            self.redo_stack.append(self.strokes.pop())
+            self._rebuild_canvas()
             self.queue_draw()
 
     def _redo(self):
@@ -994,10 +1052,10 @@ class ScreenDrawWindow(Gtk.Window):
     def _clear_canvas(self):
         self.strokes.clear()
         self.redo_stack.clear()
-        self._redraw_canvas()
+        self._rebuild_canvas()
         self.queue_draw()
 
-    # ── Toggle / Visibility ───────────────────────────────────────────────
+    # ── Visibility ────────────────────────────────────────────────────────
 
     def _toggle_overlay(self):
         if self.is_visible:
@@ -1009,7 +1067,6 @@ class ScreenDrawWindow(Gtk.Window):
         self.is_visible = True
         self.show_all()
         self.present()
-        # Set cursor to crosshair
         window = self.get_window()
         if window:
             cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
@@ -1018,36 +1075,181 @@ class ScreenDrawWindow(Gtk.Window):
     def _hide_overlay(self):
         self.is_visible = False
         self.submenu_open = None
-        self.submenu_buttons = []
+        self.submenu_items = []
         self.hide()
 
-    def _on_global_toggle(self, keystr, user_data):
-        self._toggle_overlay()
-
     def _on_destroy(self, widget):
-        if HAS_KEYBINDER:
-            Keybinder.unbind(TOGGLE_KEY)
-        Gtk.main_quit()
+        pass
+
+
+# ─── GNOME Custom Keybinding Setup ───────────────────────────────────────────
+
+def _find_keybinding_slot():
+    """Find or create a custom keybinding slot for Screen Draw."""
+    try:
+        result = subprocess.run(
+            ["gsettings", "get", GS_SCHEMA, GS_KEY],
+            capture_output=True, text=True
+        )
+        current = result.stdout.strip()
+
+        # Find existing screen-draw binding
+        if KEYBINDING_SLOT in current:
+            # Already registered
+            return None
+
+        # Find next available slot
+        if current == "@as []" or current == "[]":
+            paths = []
+        else:
+            # Parse the GVariant array
+            paths = [p.strip().strip("'") for p in
+                     current.strip("[]").split(",") if p.strip()]
+
+        new_path = f"{KEYBINDING_PATH_PREFIX}{KEYBINDING_SLOT}/"
+        paths.append(new_path)
+        return (paths, new_path)
+    except Exception as e:
+        print(f"[warn] Could not read keybindings: {e}")
+        return None
+
+
+def setup_global_hotkey():
+    """Register F9 as a global hotkey via GNOME custom keybindings."""
+    toggle_cmd = (
+        f"gdbus call --session --dest {DBUS_NAME} "
+        f"--object-path {DBUS_PATH} "
+        f"--method {DBUS_IFACE}.Toggle"
+    )
+
+    slot_info = _find_keybinding_slot()
+    if slot_info is None:
+        # Check if our binding already exists and update command
+        binding_path = f"{KEYBINDING_PATH_PREFIX}{KEYBINDING_SLOT}/"
+        try:
+            subprocess.run(
+                ["gsettings", "set",
+                 f"{GS_CUSTOM_SCHEMA}:{binding_path}",
+                 "command", toggle_cmd],
+                check=True, capture_output=True
+            )
+        except Exception:
+            pass
+        print("[✓] F9 hotkey already registered")
+        return
+
+    paths, new_path = slot_info
+
+    try:
+        # Set the custom keybinding properties
+        subprocess.run(
+            ["gsettings", "set",
+             f"{GS_CUSTOM_SCHEMA}:{new_path}",
+             "name", "Screen Draw Toggle"],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["gsettings", "set",
+             f"{GS_CUSTOM_SCHEMA}:{new_path}",
+             "command", toggle_cmd],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["gsettings", "set",
+             f"{GS_CUSTOM_SCHEMA}:{new_path}",
+             "binding", "F9"],
+            check=True, capture_output=True
+        )
+
+        # Register the new slot in the list
+        paths_str = "[" + ", ".join(f"'{p}'" for p in paths) + "]"
+        subprocess.run(
+            ["gsettings", "set", GS_SCHEMA, GS_KEY, paths_str],
+            check=True, capture_output=True
+        )
+
+        print("[✓] F9 hotkey registered via GNOME custom keybindings")
+    except subprocess.CalledProcessError as e:
+        print(f"[warn] Failed to register hotkey: {e}")
+        print("       You can manually set F9 → 'gdbus call --session"
+              f" --dest {DBUS_NAME} --object-path {DBUS_PATH}"
+              f" --method {DBUS_IFACE}.Toggle'")
+
+
+# ─── D-Bus Method Handler ─────────────────────────────────────────────────────
+
+class ScreenDrawDBusService:
+    """Expose Toggle/Show/Hide/Quit methods over D-Bus."""
+
+    def __init__(self, window):
+        self.window = window
+        self.node_info = Gio.DBusNodeInfo.new_for_xml(DBUS_XML)
+
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        try:
+            # Newer GLib API (avoids deprecation warning)
+            self.registration_id = self.bus.register_object_with_closures(
+                DBUS_PATH,
+                self.node_info.interfaces[0],
+                self._on_method_call,
+                None,
+                None,
+            )
+        except AttributeError:
+            # Fallback for older versions
+            self.registration_id = self.bus.register_object(
+                DBUS_PATH,
+                self.node_info.interfaces[0],
+                self._on_method_call,
+                None,
+                None,
+            )
+
+        # Own the bus name
+        self.owner_id = Gio.bus_own_name_on_connection(
+            self.bus,
+            DBUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            None,
+            None,
+        )
+
+    def _on_method_call(self, connection, sender, path, iface, method, params, invocation):
+        if method == "Toggle":
+            GLib.idle_add(self.window._toggle_overlay)
+        elif method == "Show":
+            GLib.idle_add(self.window._show_overlay)
+        elif method == "Hide":
+            GLib.idle_add(self.window._hide_overlay)
+        elif method == "Quit":
+            GLib.idle_add(Gtk.main_quit)
+        invocation.return_value(None)
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def main():
-    print("Screen Draw — Press F9 to toggle the overlay")
-    print("Press Ctrl+C in terminal to quit")
+    print("┌─────────────────────────────────────┐")
+    print("│  Screen Draw — Annotation Overlay    │")
+    print("├─────────────────────────────────────┤")
+    print("│  F9       Toggle overlay             │")
+    print("│  P        Pen tool                   │")
+    print("│  E        Eraser tool                │")
+    print("│  L/R/O/A  Line/Rect/Circle/Arrow     │")
+    print("│  Ctrl+Z   Undo                       │")
+    print("│  Ctrl+Y   Redo                       │")
+    print("│  Ctrl+X   Clear canvas               │")
+    print("│  Esc      Hide overlay               │")
+    print("└─────────────────────────────────────┘")
 
-    win = ScreenDrawWindow()
+    # Handle SIGINT gracefully
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    # Start hidden — press F9 to show
-    # Show briefly to initialize, then hide
-    win.show_all()
-    GLib.idle_add(lambda: (win._hide_overlay(), False))
+    # Set up the global hotkey
+    setup_global_hotkey()
 
-    try:
-        Gtk.main()
-    except KeyboardInterrupt:
-        print("\nExiting...")
-        sys.exit(0)
+    app = ScreenDrawApp()
+    app.run(None)
 
 
 if __name__ == "__main__":
