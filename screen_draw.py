@@ -15,8 +15,8 @@ import warnings
 import cairo
 import gi
 
-# Suppress harmless Gio deprecation warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="screen_draw")
+# Suppress harmless Gio deprecation warnings (register_object in newer GLib)
+warnings.filterwarnings("ignore", message=".*is deprecated", category=DeprecationWarning)
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
