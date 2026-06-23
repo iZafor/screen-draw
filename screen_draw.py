@@ -234,7 +234,9 @@ class ScreenDrawApp(Gtk.Application):
 
     def do_activate(self):
         if self._window is None:
-            self._window = ScreenDrawWindow(application=self)
+            self.hold()  # Prevent auto-quit (no ApplicationWindow)
+            self._window = ScreenDrawWindow()
+            self._window.connect("destroy", lambda _: self.release())
             self._window.show_all()
             GLib.idle_add(self._window._hide_overlay)
             # Set up D-Bus service
@@ -245,9 +247,9 @@ class ScreenDrawApp(Gtk.Application):
             self._window._toggle_overlay()
 
 
-class ScreenDrawWindow(Gtk.ApplicationWindow):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+class ScreenDrawWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Screen Draw")
 
         # ── Drawing state ──
         self.strokes = []
@@ -305,9 +307,6 @@ class ScreenDrawWindow(Gtk.ApplicationWindow):
         self.set_default_size(self.mon_width, self.mon_height)
         self.move(geom.x, geom.y)
         self.fullscreen()
-
-        # Window type
-        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
 
         # Input events
         self.add_events(
