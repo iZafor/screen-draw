@@ -946,6 +946,8 @@ class ScreenDrawWindow(Gtk.Window):
     # ── Input Events ──────────────────────────────────────────────────────
 
     def _on_button_press(self, widget, event):
+        if event.type != Gdk.EventType.BUTTON_PRESS:
+            return
         if event.button != 1:
             return
         x, y = event.x, event.y
