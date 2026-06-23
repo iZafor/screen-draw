@@ -75,6 +75,7 @@ COLOR_PRESETS = [
 ]
 
 STROKE_PRESETS = [2, 3, 5, 8, 12, 18, 26]
+ERASER_RADIUS_PRESETS = [6, 10, 16, 24, 36, 50]
 
 TOOLBAR_HEIGHT = 50
 TOOLBAR_PADDING = 5
@@ -263,10 +264,11 @@ class ScreenDrawWindow(Gtk.Window):
         self.current_tool = TOOL_PEN
         self.current_color = "#FF3B30"
         self.stroke_width = 5
+        self.eraser_radius = 16
         self.is_visible = False
 
         # ── UI state ──
-        self.submenu_open = None   # "pen_options" | None
+        self.submenu_open = None   # "pen_options" | "eraser_options" | None
         self.submenu_items = []
         self.toolbar_buttons = []
         self.hover_button = None
@@ -442,7 +444,7 @@ class ScreenDrawWindow(Gtk.Window):
             cr.set_source_rgba(1, 1, 1, 0.5)
             cr.set_line_width(1.5)
             cr.arc(self.mouse_x, self.mouse_y,
-                   self.stroke_width * 1.5, 0, 2 * math.pi)
+                   self.eraser_radius, 0, 2 * math.pi)
             cr.stroke()
 
         # Toolbar
@@ -451,6 +453,8 @@ class ScreenDrawWindow(Gtk.Window):
         # Submenu
         if self.submenu_open == "pen_options":
             self._draw_pen_submenu(cr, w)
+        elif self.submenu_open == "eraser_options":
+            self._draw_eraser_submenu(cr, w)
 
     def _draw_current_stroke(self, cr):
         """Render the stroke currently being drawn."""
@@ -461,7 +465,7 @@ class ScreenDrawWindow(Gtk.Window):
 
         elif self.current_tool == TOOL_ERASER and len(self.current_points) >= 2:
             FreehandStroke(
-                self.current_points, "#000", self.stroke_width * 3,
+                self.current_points, "#000", self.eraser_radius * 2,
                 is_eraser=True
             ).draw(cr)
 
@@ -657,25 +661,28 @@ class ScreenDrawWindow(Gtk.Window):
 
         elif name == "clear":
             cr.set_source_rgba(1, 0.35, 0.35, 0.8)
-            # Trash icon
+            # Trash icon — vertically centered around (cx, cy)
             cr.set_line_width(1.8)
+            top = cy - 9   # top of handle
+            lid_y = cy - 5  # lid line
+            bot = cy + 8   # bottom of can
             # Can body
-            rounded_rect(cr, cx - 7, cy - 2, 14, 13, 2)
+            rounded_rect(cr, cx - 7, lid_y, 14, bot - lid_y, 2)
             cr.stroke()
             # Lid
-            cr.move_to(cx - 9, cy - 2)
-            cr.line_to(cx + 9, cy - 2)
+            cr.move_to(cx - 9, lid_y)
+            cr.line_to(cx + 9, lid_y)
             cr.stroke()
             # Handle
-            cr.move_to(cx - 3, cy - 2)
-            cr.line_to(cx - 2, cy - 5)
-            cr.line_to(cx + 2, cy - 5)
-            cr.line_to(cx + 3, cy - 2)
+            cr.move_to(cx - 3, lid_y)
+            cr.line_to(cx - 2, top)
+            cr.line_to(cx + 2, top)
+            cr.line_to(cx + 3, lid_y)
             cr.stroke()
             # Lines
             for dx in (-3, 0, 3):
-                cr.move_to(cx + dx, cy + 1)
-                cr.line_to(cx + dx, cy + 8)
+                cr.move_to(cx + dx, lid_y + 3)
+                cr.line_to(cx + dx, bot - 3)
                 cr.stroke()
 
         elif name == "close":
@@ -829,7 +836,81 @@ class ScreenDrawWindow(Gtk.Window):
             cr.fill()
 
             self.submenu_items.append({
-                "type": "stroke", "value": sw,
+                "type": "pen_stroke", "value": sw,
+                "x": sx, "y": sy,
+                "w": SM_STROKE_PILL_W, "h": SM_STROKE_PILL_H,
+            })
+
+    def _draw_eraser_submenu(self, cr, w):
+        eraser_btn = next((b for b in self.toolbar_buttons if b["name"] == "eraser"), None)
+        if not eraser_btn:
+            return
+
+        sm_w = len(ERASER_RADIUS_PRESETS) * (SM_STROKE_PILL_W + 4) + 28
+        sm_h = 70
+        sm_x = min(max(eraser_btn["x"] + eraser_btn["w"] / 2 - sm_w / 2, 10), w - sm_w - 10)
+        sm_y = TOOLBAR_HEIGHT + 8
+
+        # Background
+        rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, 14)
+        cr.set_source_rgba(0.12, 0.12, 0.14, 0.96)
+        cr.fill()
+        rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, 14)
+        cr.set_source_rgba(1, 1, 1, 0.06)
+        cr.set_line_width(1)
+        cr.stroke()
+
+        # Pointer triangle
+        tri_cx = eraser_btn["x"] + eraser_btn["w"] / 2
+        tri_cy = sm_y
+        cr.move_to(tri_cx - 8, tri_cy)
+        cr.line_to(tri_cx, tri_cy - 6)
+        cr.line_to(tri_cx + 8, tri_cy)
+        cr.close_path()
+        cr.set_source_rgba(0.18, 0.18, 0.20, 0.96)
+        cr.fill()
+
+        self.submenu_items = []
+        pad_x = sm_x + 16
+        cur_y = sm_y + 14
+
+        # Label: RADIUS
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10)
+        cr.move_to(pad_x, cur_y)
+        cr.show_text("RADIUS")
+        cur_y += 8
+
+        # Eraser radius pills
+        for i, rad in enumerate(ERASER_RADIUS_PRESETS):
+            sx = pad_x + i * (SM_STROKE_PILL_W + 4)
+            sy = cur_y
+            is_sel = self.eraser_radius == rad
+
+            # Pill background
+            rounded_rect(cr, sx, sy, SM_STROKE_PILL_W, SM_STROKE_PILL_H, 6)
+            if is_sel:
+                cr.set_source_rgba(1, 1, 1, 0.3)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.06)
+            cr.fill()
+
+            if is_sel:
+                rounded_rect(cr, sx, sy, SM_STROKE_PILL_W, SM_STROKE_PILL_H, 6)
+                cr.set_source_rgba(1, 1, 1, 0.15)
+                cr.set_line_width(1)
+                cr.stroke()
+
+            # Dot proportional to radius
+            dot_r = max(rad / 3.5, 1.5)
+            cr.arc(sx + SM_STROKE_PILL_W / 2, sy + SM_STROKE_PILL_H / 2,
+                   dot_r, 0, 2 * math.pi)
+            cr.set_source_rgba(1, 1, 1, 0.85)
+            cr.fill()
+
+            self.submenu_items.append({
+                "type": "eraser_radius", "value": rad,
                 "x": sx, "y": sy,
                 "w": SM_STROKE_PILL_W, "h": SM_STROKE_PILL_H,
             })
@@ -858,6 +939,8 @@ class ScreenDrawWindow(Gtk.Window):
     def _in_submenu_zone(self, x, y):
         if not self.submenu_open:
             return False
+        if self.submenu_open == "eraser_options":
+            return TOOLBAR_HEIGHT < y < TOOLBAR_HEIGHT + 90
         return TOOLBAR_HEIGHT < y < TOOLBAR_HEIGHT + 130
 
     # ── Input Events ──────────────────────────────────────────────────────
@@ -909,7 +992,7 @@ class ScreenDrawWindow(Gtk.Window):
 
         elif self.current_tool == TOOL_ERASER and len(self.current_points) >= 2:
             stroke = FreehandStroke(
-                list(self.current_points), "#000", self.stroke_width * 3,
+                list(self.current_points), "#000", self.eraser_radius * 2,
                 is_eraser=True
             )
             self._commit_stroke(stroke)
@@ -1003,11 +1086,23 @@ class ScreenDrawWindow(Gtk.Window):
     # ── Actions ───────────────────────────────────────────────────────────
 
     def _handle_toolbar_click(self, name):
-        tool_names = {TOOL_PEN, TOOL_ERASER, TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
+        tool_names = {TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
 
         if name == "pen":
-            self._select_tool(TOOL_PEN)
-            self.submenu_open = "pen_options" if self.submenu_open != "pen_options" else None
+            if self.current_tool == TOOL_PEN:
+                # Already selected — toggle submenu
+                self.submenu_open = "pen_options" if self.submenu_open != "pen_options" else None
+            else:
+                self._select_tool(TOOL_PEN)
+                self.submenu_open = None
+            self.submenu_items = []
+        elif name == "eraser":
+            if self.current_tool == TOOL_ERASER:
+                # Already selected — toggle submenu
+                self.submenu_open = "eraser_options" if self.submenu_open != "eraser_options" else None
+            else:
+                self._select_tool(TOOL_ERASER)
+                self.submenu_open = None
             self.submenu_items = []
         elif name in tool_names:
             self._select_tool(name)
@@ -1026,15 +1121,16 @@ class ScreenDrawWindow(Gtk.Window):
     def _handle_submenu_click(self, item):
         if item["type"] == "color":
             self.current_color = item["value"]
-        elif item["type"] == "stroke":
+        elif item["type"] == "pen_stroke":
             self.stroke_width = item["value"]
+        elif item["type"] == "eraser_radius":
+            self.eraser_radius = item["value"]
         self.queue_draw()
 
     def _select_tool(self, tool):
         self.current_tool = tool
-        if tool != TOOL_PEN:
-            self.submenu_open = None
-            self.submenu_items = []
+        self.submenu_open = None
+        self.submenu_items = []
         self.queue_draw()
 
     def _undo(self):
