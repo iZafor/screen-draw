@@ -306,7 +306,10 @@ class ScreenDrawWindow(Gtk.Window):
 
         self.set_default_size(self.mon_width, self.mon_height)
         self.move(geom.x, geom.y)
-        self.fullscreen()
+        # NOTE: Do NOT call fullscreen() — on GNOME/Mutter Wayland, fullscreen
+        # windows are "unredirected" (bypass the compositor), which makes RGBA
+        # transparency impossible. Instead we size the window to fill the screen.
+        self.resize(self.mon_width, self.mon_height)
 
         # Input events
         self.add_events(
