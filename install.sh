@@ -1,33 +1,47 @@
 #!/bin/bash
-# install.sh — Install dependencies for Screen Draw on Fedora
+# install.sh — Install or update Screen Draw on Fedora
 
 set -e
 
+UPDATE_ONLY=0
+for arg in "$@"; do
+    if [ "$arg" == "--update" ] || [ "$arg" == "-u" ]; then
+        UPDATE_ONLY=1
+    fi
+done
+
 echo "╔══════════════════════════════════════════╗"
-echo "║       Screen Draw — Install Script       ║"
+if [ $UPDATE_ONLY -eq 1 ]; then
+    echo "║        Screen Draw — Update Script       ║"
+else
+    echo "║       Screen Draw — Install Script       ║"
+fi
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# Check if running on Fedora
-if [ -f /etc/fedora-release ]; then
-    echo "[*] Detected Fedora"
-else
-    echo "[!] This script is designed for Fedora. Adjust package names for your distro."
+if [ $UPDATE_ONLY -eq 0 ]; then
+    # Check if running on Fedora
+    if [ -f /etc/fedora-release ]; then
+        echo "[*] Detected Fedora"
+    else
+        echo "[!] This script is designed for Fedora. Adjust package names for your distro."
+    fi
+
+    echo "[*] Installing dependencies..."
+    sudo dnf install -y \
+        python3-gobject \
+        gtk3 \
+        gtk-layer-shell \
+        keybinder3
 fi
 
-echo "[*] Installing dependencies..."
-sudo dnf install -y \
-    python3-gobject \
-    gtk3 \
-    gtk-layer-shell \
-    keybinder3
-
-echo "[*] Installing application..."
+echo "[*] Copying application files..."
 sudo cp screen_draw.py /usr/local/bin/screen-draw
 sudo chmod +x /usr/local/bin/screen-draw
 
-echo "[*] Creating desktop entry..."
-cat <<EOF | sudo tee /usr/share/applications/screen-draw.desktop > /dev/null
+if [ $UPDATE_ONLY -eq 0 ]; then
+    echo "[*] Creating desktop entry..."
+    cat <<EOF | sudo tee /usr/share/applications/screen-draw.desktop > /dev/null
 [Desktop Entry]
 Name=Screen Draw
 Comment=Draw annotations over your screen
@@ -39,9 +53,14 @@ Categories=Utility;Graphics;
 Keywords=draw;annotate;screen;overlay;
 StartupNotify=false
 EOF
+fi
 
 echo ""
-echo "[✓] Screen Draw installed successfully!"
+if [ $UPDATE_ONLY -eq 1 ]; then
+    echo "[✓] Screen Draw updated successfully!"
+else
+    echo "[✓] Screen Draw installed successfully!"
+fi
 echo ""
 echo "Usage:"
 echo "  Run 'screen-draw' from your app drawer or terminal."
