@@ -309,6 +309,7 @@ class ScreenDrawWindow(Gtk.Window):
         self.set_decorated(False)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
         self.set_keep_above(True)
         self.set_accept_focus(True)
         self.set_title("Screen Draw")
@@ -1352,7 +1353,11 @@ class ScreenDrawWindow(Gtk.Window):
         """Idle callback to re-assert window on top after focus loss."""
         if self.is_visible:
             self.set_keep_above(True)
-            self.present()
+            # Avoid self.present() here as it triggers focus-stealing prevention
+            # in GNOME/Mutter, which ironically sinks the window.
+            window = self.get_window()
+            if window:
+                window.raise_()
         return False  # don't repeat
 
     def _start_focus_keepalive(self):
