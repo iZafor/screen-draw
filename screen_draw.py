@@ -1026,6 +1026,8 @@ class ScreenDrawWindow(Gtk.Window):
         if self.submenu_open:
             self.submenu_open = None
             self.submenu_items = []
+            if self._passthrough_mode:
+                self._update_input_shape()
             self._schedule_draw()
             return
 
@@ -1249,6 +1251,11 @@ class ScreenDrawWindow(Gtk.Window):
         elif name == "close":
             self._hide_overlay()
         self._schedule_draw()
+        
+        # If we are in passthrough mode, clicking buttons like pen/eraser might 
+        # have changed the submenu state, requiring an input shape update.
+        if self._passthrough_mode:
+            self._update_input_shape()
 
     def _handle_submenu_click(self, item):
         if item["type"] == "color":
@@ -1290,6 +1297,43 @@ class ScreenDrawWindow(Gtk.Window):
 
     # ── Visibility ────────────────────────────────────────────────────────
 
+    def _update_input_shape(self):
+        """Update the window's input shape region based on passthrough mode."""
+        window = self.get_window()
+        if not window:
+            return
+
+        if not self._passthrough_mode:
+            # Full screen input
+            region = cairo.Region(cairo.RectangleInt(0, 0, self.mon_width, self.mon_height))
+            window.input_shape_combine_region(region, 0, 0)
+            return
+
+        # Passthrough mode: Only toolbar and submenu are clickable
+        region = cairo.Region()
+
+        first = None
+        last = None
+        for b in self.toolbar_buttons:
+            if not b["name"].startswith("__sep"):
+                if first is None:
+                    first = b
+                last = b
+                
+        if first and last:
+            bar_x = first["x"] - 10
+            bar_w = (last["x"] + last["w"]) - first["x"] + 20
+            # Include drop shadow bounds
+            region.union(cairo.RectangleInt(int(bar_x - 6), 0, int(bar_w + 12), TOOLBAR_HEIGHT + 6))
+
+        if self.submenu_open:
+            if self.submenu_open == "eraser_options":
+                region.union(cairo.RectangleInt(0, TOOLBAR_HEIGHT, self.mon_width, 90))
+            else:
+                region.union(cairo.RectangleInt(0, TOOLBAR_HEIGHT, self.mon_width, 130))
+
+        window.input_shape_combine_region(region, 0, 0)
+
     def _toggle_overlay(self):
         if self._passthrough_mode:
             self._exit_passthrough()
@@ -1316,10 +1360,7 @@ class ScreenDrawWindow(Gtk.Window):
         self.submenu_items = []
         self._stop_focus_keepalive()
         # Reset input shape before hiding
-        window = self.get_window()
-        if window:
-            region = cairo.Region(cairo.RectangleInt(0, 0, self.mon_width, self.mon_height))
-            window.input_shape_combine_region(region, 0, 0)
+        self._update_input_shape()
         self.hide()
 
     def _enter_passthrough(self):
@@ -1327,21 +1368,15 @@ class ScreenDrawWindow(Gtk.Window):
         self._passthrough_mode = True
         self.submenu_open = None
         self.submenu_items = []
-        window = self.get_window()
-        if window:
-            # Empty region = entire window is click-through
-            region = cairo.Region()
-            window.input_shape_combine_region(region, 0, 0)
+        self._update_input_shape()
         self._schedule_draw()
 
     def _exit_passthrough(self):
         """Restore input handling on the overlay."""
         self._passthrough_mode = False
+        self._update_input_shape()
         window = self.get_window()
         if window:
-            # Restore full input region
-            region = cairo.Region(cairo.RectangleInt(0, 0, self.mon_width, self.mon_height))
-            window.input_shape_combine_region(region, 0, 0)
             window.set_cursor(self._get_cursor("crosshair"))
         self._cursor_zone = None  # force cursor zone re-evaluation
         self._schedule_draw()
