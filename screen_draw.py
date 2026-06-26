@@ -7,6 +7,11 @@ Toggle the overlay with F9.
 """
 
 import os
+
+# Force X11 backend (XWayland) because native GNOME Wayland strictly 
+# prevents normal windows from being global always-on-top overlays.
+os.environ["GDK_BACKEND"] = "x11"
+
 import sys
 import math
 import time
