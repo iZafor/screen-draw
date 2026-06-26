@@ -469,7 +469,7 @@ class ScreenDrawWindow(Gtk.Window):
             self._draw_current_stroke(cr)
 
         # Eraser cursor circle
-        if self.current_tool == TOOL_ERASER and not self.is_drawing:
+        if self.current_tool == TOOL_ERASER and not self.is_drawing and not self._passthrough_mode:
             cr.set_source_rgba(1, 1, 1, 0.5)
             cr.set_line_width(1.5)
             cr.arc(self.mouse_x, self.mouse_y,
