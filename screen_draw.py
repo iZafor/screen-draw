@@ -83,6 +83,7 @@ COLOR_PRESETS = [
 
 STROKE_PRESETS = [2, 3, 5, 8, 12, 18, 26]
 ERASER_RADIUS_PRESETS = [6, 10, 16, 24, 36, 50]
+TEXT_SIZE_PRESETS = [16, 24, 32, 48, 64, 96]
 
 TOOLBAR_HEIGHT = 50
 TOOLBAR_PADDING = 5
@@ -232,18 +233,30 @@ class ShapeStroke:
 class TextStroke:
     """A text stroke."""
 
-    def __init__(self, text, x, y, color, font_size):
+    def __init__(self, text, x, y, color, font_size, bg_color):
         self.text = text
         self.x, self.y = x, y
         self.color = color
         self.font_size = font_size
+        self.bg_color = bg_color
 
     def draw(self, cr):
-        r, g, b, a = hex_to_rgba(self.color)
-        cr.set_source_rgba(r, g, b, a)
         cr.set_operator(cairo.OPERATOR_OVER)
         cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         cr.set_font_size(self.font_size)
+        
+        if self.bg_color and self.bg_color != "transparent":
+            cr.set_source_rgba(*hex_to_rgba(self.bg_color))
+            extents = cr.text_extents(self.text)
+            pad = 8
+            cr.rectangle(self.x + extents.x_bearing - pad, 
+                         self.y + extents.y_bearing - pad,
+                         extents.width + pad * 2, 
+                         extents.height + pad * 2)
+            cr.fill()
+
+        r, g, b, a = hex_to_rgba(self.color)
+        cr.set_source_rgba(r, g, b, a)
         cr.move_to(self.x, self.y)
         cr.show_text(self.text)
 
@@ -299,6 +312,8 @@ class ScreenDrawWindow(Gtk.Window):
         self.typing_y = 0
         self.typing_text = ""
         self._blink_id = None
+        self.text_size = 24
+        self.text_bg_color = "transparent"
 
         # ── UI state ──
         self.submenu_open = None   # "pen_options" | "eraser_options" | None
@@ -515,11 +530,25 @@ class ScreenDrawWindow(Gtk.Window):
             self._draw_pen_submenu(cr, w)
         elif self.submenu_open == "eraser_options":
             self._draw_eraser_submenu(cr, w)
+        elif self.submenu_open == "text_options":
+            self._draw_text_submenu(cr, w)
 
     def _draw_typing_text(self, cr):
-        font_size = 14 + self.stroke_width * 2
+        font_size = self.text_size
         cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         cr.set_font_size(font_size)
+        
+        extents = cr.text_extents(self.typing_text) if self.typing_text else cr.text_extents("")
+        
+        if self.text_bg_color and self.text_bg_color != "transparent" and self.typing_text:
+            cr.set_source_rgba(*hex_to_rgba(self.text_bg_color))
+            pad = 8
+            cr.rectangle(self.typing_x + extents.x_bearing - pad, 
+                         self.typing_y + extents.y_bearing - pad,
+                         extents.width + pad * 2, 
+                         extents.height + pad * 2)
+            cr.fill()
+
         r, g, b, a = hex_to_rgba(self.current_color)
         cr.set_source_rgba(r, g, b, a)
         
@@ -527,7 +556,6 @@ class ScreenDrawWindow(Gtk.Window):
         if self.typing_text:
             cr.show_text(self.typing_text)
             
-        extents = cr.text_extents(self.typing_text) if self.typing_text else cr.text_extents("")
         cursor_x = self.typing_x + extents.x_advance
         cursor_y = self.typing_y
         
@@ -1031,6 +1059,189 @@ class ScreenDrawWindow(Gtk.Window):
                 "w": SM_STROKE_PILL_W, "h": SM_STROKE_PILL_H,
             })
 
+    def _draw_text_submenu(self, cr, w):
+        text_btn = next((b for b in self.toolbar_buttons if b["name"] == "text"), None)
+        if not text_btn:
+            return
+
+        # Layout
+        n_colors = len(COLOR_PRESETS)
+        n_bg_colors = n_colors + 1 # include transparent
+        n_sizes = len(TEXT_SIZE_PRESETS)
+        
+        color_row_w = n_colors * (SM_COLOR_SWATCH + SM_COLOR_GAP) - SM_COLOR_GAP
+        bg_row_w = n_bg_colors * (SM_COLOR_SWATCH + SM_COLOR_GAP) - SM_COLOR_GAP
+        size_row_w = n_sizes * (SM_STROKE_PILL_W + 4) - 4
+        
+        sm_content_w = max(color_row_w, bg_row_w, size_row_w)
+        sm_w = sm_content_w + 32
+        sm_h = 160
+        sm_x = min(max(text_btn["x"] + text_btn["w"] / 2 - sm_w / 2, 10), w - sm_w - 10)
+        sm_y = TOOLBAR_HEIGHT + 8
+
+        # Background
+        rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, 14)
+        grad = cairo.LinearGradient(sm_x, sm_y, sm_x, sm_y + sm_h)
+        grad.add_color_stop_rgba(0, 0.18, 0.18, 0.20, 0.96)
+        grad.add_color_stop_rgba(1, 0.12, 0.12, 0.14, 0.96)
+        cr.set_source(grad)
+        cr.fill()
+        
+        rounded_rect(cr, sm_x, sm_y, sm_w, sm_h, 14)
+        cr.set_source_rgba(1, 1, 1, 0.06)
+        cr.set_line_width(1)
+        cr.stroke()
+
+        # Pointer triangle
+        tri_cx = text_btn["x"] + text_btn["w"] / 2
+        tri_cy = sm_y
+        cr.move_to(tri_cx - 8, tri_cy)
+        cr.line_to(tri_cx, tri_cy - 6)
+        cr.line_to(tri_cx + 8, tri_cy)
+        cr.close_path()
+        cr.set_source_rgba(0.18, 0.18, 0.20, 0.96)
+        cr.fill()
+
+        self.submenu_items = []
+        pad_x = sm_x + 16
+        cur_y = sm_y + 14
+
+        # 1. Label: TEXT COLOR
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(10)
+        cr.move_to(pad_x, cur_y)
+        cr.show_text("TEXT COLOR")
+        cur_y += 8
+
+        # Color swatches
+        for i, (hex_c, _name) in enumerate(COLOR_PRESETS):
+            sx = pad_x + i * (SM_COLOR_SWATCH + SM_COLOR_GAP)
+            sy = cur_y
+            rc, gc, bc, _ = hex_to_rgba(hex_c)
+
+            if hex_c == self.current_color:
+                cr.new_sub_path()
+                cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                       SM_COLOR_SWATCH / 2 + 3, 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.7)
+                cr.set_line_width(2)
+                cr.stroke()
+
+            cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                   SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
+            cr.set_source_rgba(rc, gc, bc, 1)
+            cr.fill()
+
+            if hex_c in ("#FFFFFF", "#FFCC00"):
+                cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                       SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.2)
+                cr.set_line_width(1)
+                cr.stroke()
+
+            self.submenu_items.append({
+                "type": "color", "value": hex_c,
+                "x": sx, "y": sy,
+                "w": SM_COLOR_SWATCH, "h": SM_COLOR_SWATCH,
+            })
+
+        cur_y += SM_COLOR_SWATCH + 14
+
+        # 2. Label: BACKGROUND
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.set_font_size(10)
+        cr.move_to(pad_x, cur_y)
+        cr.show_text("BACKGROUND")
+        cur_y += 8
+
+        # Background swatches (including transparent)
+        bg_options = [("transparent", "Transparent")] + COLOR_PRESETS
+        for i, (hex_c, _name) in enumerate(bg_options):
+            sx = pad_x + i * (SM_COLOR_SWATCH + SM_COLOR_GAP)
+            sy = cur_y
+            
+            if hex_c == self.text_bg_color:
+                cr.new_sub_path()
+                cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                       SM_COLOR_SWATCH / 2 + 3, 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.7)
+                cr.set_line_width(2)
+                cr.stroke()
+                
+            if hex_c == "transparent":
+                cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                       SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
+                cr.set_source_rgba(0.2, 0.2, 0.2, 1)
+                cr.fill_preserve()
+                cr.set_source_rgba(1, 0.3, 0.3, 1)
+                cr.set_line_width(2)
+                cr.move_to(sx + 4, sy + 4)
+                cr.line_to(sx + SM_COLOR_SWATCH - 4, sy + SM_COLOR_SWATCH - 4)
+                cr.stroke()
+            else:
+                rc, gc, bc, _ = hex_to_rgba(hex_c)
+                cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                       SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
+                cr.set_source_rgba(rc, gc, bc, 1)
+                cr.fill()
+                if hex_c in ("#FFFFFF", "#FFCC00"):
+                    cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
+                           SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
+                    cr.set_source_rgba(1, 1, 1, 0.2)
+                    cr.set_line_width(1)
+                    cr.stroke()
+
+            self.submenu_items.append({
+                "type": "text_bg_color", "value": hex_c,
+                "x": sx, "y": sy,
+                "w": SM_COLOR_SWATCH, "h": SM_COLOR_SWATCH,
+            })
+
+        cur_y += SM_COLOR_SWATCH + 14
+        
+        # 3. Label: SIZE
+        cr.set_source_rgba(1, 1, 1, 0.4)
+        cr.set_font_size(10)
+        cr.move_to(pad_x, cur_y)
+        cr.show_text("SIZE")
+        cur_y += 8
+        
+        # Size pills
+        for i, size in enumerate(TEXT_SIZE_PRESETS):
+            sx = pad_x + i * (SM_STROKE_PILL_W + 4)
+            sy = cur_y
+            is_sel = self.text_size == size
+            
+            rounded_rect(cr, sx, sy, SM_STROKE_PILL_W, SM_STROKE_PILL_H, 6)
+            if is_sel:
+                rc, gc, bc, _ = hex_to_rgba(self.current_color, 0.3)
+                cr.set_source_rgba(rc, gc, bc, 0.3)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.06)
+            cr.fill()
+
+            if is_sel:
+                rounded_rect(cr, sx, sy, SM_STROKE_PILL_W, SM_STROKE_PILL_H, 6)
+                cr.set_source_rgba(1, 1, 1, 0.15)
+                cr.set_line_width(1)
+                cr.stroke()
+                
+            cr.set_source_rgba(1, 1, 1, 0.85)
+            cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(12)
+            ext = cr.text_extents(str(size))
+            cr.move_to(sx + SM_STROKE_PILL_W/2 - ext.width/2 - ext.x_bearing, 
+                       sy + SM_STROKE_PILL_H/2 - ext.height/2 - ext.y_bearing)
+            cr.show_text(str(size))
+            
+            self.submenu_items.append({
+                "type": "text_size", "value": size,
+                "x": sx, "y": sy,
+                "w": SM_STROKE_PILL_W, "h": SM_STROKE_PILL_H,
+            })
+
+
     # ── Hit Testing ───────────────────────────────────────────────────────
 
     def _hit_toolbar(self, x, y):
@@ -1057,6 +1268,8 @@ class ScreenDrawWindow(Gtk.Window):
             return False
         if self.submenu_open == "eraser_options":
             return TOOLBAR_HEIGHT < y < TOOLBAR_HEIGHT + 90
+        if self.submenu_open == "text_options":
+            return TOOLBAR_HEIGHT < y < TOOLBAR_HEIGHT + 180
         return TOOLBAR_HEIGHT < y < TOOLBAR_HEIGHT + 130
 
     # ── Input Events ──────────────────────────────────────────────────────
@@ -1170,10 +1383,9 @@ class ScreenDrawWindow(Gtk.Window):
 
     def _commit_text(self):
         if self.is_typing and self.typing_text.strip():
-            font_size = 14 + self.stroke_width * 2
             stroke = TextStroke(
                 self.typing_text, self.typing_x, self.typing_y,
-                self.current_color, font_size
+                self.current_color, self.text_size, self.text_bg_color
             )
             self._commit_stroke(stroke)
         self.is_typing = False
@@ -1392,10 +1604,10 @@ class ScreenDrawWindow(Gtk.Window):
                 self.submenu_open = None
                 self.submenu_items = []
             else:
-                if self.submenu_open == "pen_options":
+                if self.submenu_open == "text_options":
                     self.submenu_open = None
                 else:
-                    self.submenu_open = "pen_options"
+                    self.submenu_open = "text_options"
                 self.submenu_items = []
         elif name == "eraser":
             if self._passthrough_mode:
@@ -1441,6 +1653,10 @@ class ScreenDrawWindow(Gtk.Window):
             self.stroke_width = item["value"]
         elif item["type"] == "eraser_radius":
             self.eraser_radius = item["value"]
+        elif item["type"] == "text_bg_color":
+            self.text_bg_color = item["value"]
+        elif item["type"] == "text_size":
+            self.text_size = item["value"]
         self._schedule_draw()
 
     def _select_tool(self, tool):
@@ -1508,6 +1724,8 @@ class ScreenDrawWindow(Gtk.Window):
         if self.submenu_open:
             if self.submenu_open == "eraser_options":
                 region.union(cairo.RectangleInt(0, TOOLBAR_HEIGHT, self.mon_width, 90))
+            elif self.submenu_open == "text_options":
+                region.union(cairo.RectangleInt(0, TOOLBAR_HEIGHT, self.mon_width, 180))
             else:
                 region.union(cairo.RectangleInt(0, TOOLBAR_HEIGHT, self.mon_width, 130))
 
