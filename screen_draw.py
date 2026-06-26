@@ -274,9 +274,14 @@ class ScreenDrawWindow(Gtk.Window):
         self.hover_button = None
         self.mouse_x = 0
         self.mouse_y = 0
+        self._last_toolbar_click_time = 0  # debounce duplicate GTK events
+        self._passthrough_mode = False  # click-through interact mode
 
         # ── Canvas surface ──
         self.canvas_surface = None
+
+        # ── Focus-keepalive timer ──
+        self._focus_keepalive_id = None
 
         # ── Setup ──
         self._setup_window()
@@ -332,6 +337,7 @@ class ScreenDrawWindow(Gtk.Window):
         self.connect("key-press-event", self._on_key_press)
         self.connect("destroy", self._on_destroy)
         self.connect("configure-event", self._on_configure)
+        self.connect("focus-out-event", self._on_focus_out)
 
     # ── Toolbar Definition ────────────────────────────────────────────────
 
@@ -351,7 +357,8 @@ class ScreenDrawWindow(Gtk.Window):
             ("redo",   "Redo (Ctrl+Y)", False),
             ("clear",  "Clear (Ctrl+X)",False),
             ("__sep3", "",              False),
-            ("close",  "Hide (Esc)",    False),
+            ("cursor", "Interact (C)",  False),
+            ("close",  "Close (F9)",    False),
         ]
         for name, tip, is_active in defs:
             self.toolbar_buttons.append({
@@ -427,9 +434,10 @@ class ScreenDrawWindow(Gtk.Window):
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
 
-        # Very light tint so user knows overlay is active
-        cr.set_source_rgba(0, 0, 0, 0.03)
-        cr.paint()
+        # Very light tint so user knows overlay is active (skip in passthrough mode)
+        if not self._passthrough_mode:
+            cr.set_source_rgba(0, 0, 0, 0.03)
+            cr.paint()
 
         # Paint committed strokes
         cr.set_source_surface(self.canvas_surface, 0, 0)
@@ -532,7 +540,10 @@ class ScreenDrawWindow(Gtk.Window):
                 continue
 
             bx, by, bw, bh = b["x"], b["y"], b["w"], b["h"]
-            is_active = name in tool_names and self.current_tool == name
+            if name == "cursor":
+                is_active = self._passthrough_mode
+            else:
+                is_active = name in tool_names and self.current_tool == name
             is_hover = (self.hover_button == name)
 
             # Button background
@@ -685,6 +696,24 @@ class ScreenDrawWindow(Gtk.Window):
                 cr.line_to(cx + dx, bot - 3)
                 cr.stroke()
 
+        elif name == "cursor":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            # Classic mouse pointer cursor
+            px, py = cx - 5, cy - 9
+            cr.new_sub_path()
+            cr.move_to(px, py)              # tip
+            cr.line_to(px, py + 16)         # left edge down
+            cr.line_to(px + 5, py + 12)     # notch inward
+            cr.line_to(px + 8, py + 17)     # handle lower
+            cr.line_to(px + 11, py + 15)    # handle right
+            cr.line_to(px + 7, py + 10)     # handle upper
+            cr.line_to(px + 12, py + 8)     # right wing
+            cr.close_path()
+            cr.fill_preserve()
+            cr.set_source_rgba(0, 0, 0, 0.4)
+            cr.set_line_width(1)
+            cr.stroke()
+
         elif name == "close":
             cr.set_source_rgba(1, 1, 1, 0.65)
             cr.set_line_width(2.5)
@@ -772,6 +801,7 @@ class ScreenDrawWindow(Gtk.Window):
 
             # Selection ring
             if hex_c == self.current_color:
+                cr.new_sub_path()
                 cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
                        SM_COLOR_SWATCH / 2 + 3, 0, 2 * math.pi)
                 cr.set_source_rgba(1, 1, 1, 0.7)
@@ -956,6 +986,11 @@ class ScreenDrawWindow(Gtk.Window):
         if self._in_toolbar_zone(y):
             btn = self._hit_toolbar(x, y)
             if btn:
+                # Debounce: ignore duplicate events within 200ms
+                now = event.time  # GDK timestamp in milliseconds
+                if now - self._last_toolbar_click_time < 200:
+                    return
+                self._last_toolbar_click_time = now
                 self._handle_toolbar_click(btn["name"])
             return
 
@@ -1065,7 +1100,11 @@ class ScreenDrawWindow(Gtk.Window):
         if keyname == TOGGLE_KEY:
             self._toggle_overlay()
         elif keyname == "Escape":
-            self._hide_overlay()
+            # Close any open submenu; do NOT hide the overlay
+            if self.submenu_open:
+                self.submenu_open = None
+                self.submenu_items = []
+                self.queue_draw()
         elif ctrl and keyname in ("z", "Z"):
             self._undo()
         elif ctrl and keyname in ("y", "Y"):
@@ -1084,6 +1123,8 @@ class ScreenDrawWindow(Gtk.Window):
             self._select_tool(TOOL_CIRCLE)
         elif not ctrl and keyname in ("a", "A"):
             self._select_tool(TOOL_ARROW)
+        elif not ctrl and keyname in ("c", "C"):
+            self._enter_passthrough()
 
     # ── Actions ───────────────────────────────────────────────────────────
 
@@ -1091,21 +1132,31 @@ class ScreenDrawWindow(Gtk.Window):
         tool_names = {TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
 
         if name == "pen":
-            if self.current_tool == TOOL_PEN:
-                # Already selected — toggle submenu
-                self.submenu_open = "pen_options" if self.submenu_open != "pen_options" else None
-            else:
-                self._select_tool(TOOL_PEN)
+            if self.current_tool != TOOL_PEN:
+                # First click: just select the pen, close any open submenu
+                self.current_tool = TOOL_PEN
                 self.submenu_open = None
-            self.submenu_items = []
+                self.submenu_items = []
+            else:
+                # Already selected — toggle submenu
+                if self.submenu_open == "pen_options":
+                    self.submenu_open = None
+                else:
+                    self.submenu_open = "pen_options"
+                self.submenu_items = []
         elif name == "eraser":
-            if self.current_tool == TOOL_ERASER:
-                # Already selected — toggle submenu
-                self.submenu_open = "eraser_options" if self.submenu_open != "eraser_options" else None
-            else:
-                self._select_tool(TOOL_ERASER)
+            if self.current_tool != TOOL_ERASER:
+                # First click: just select the eraser, close any open submenu
+                self.current_tool = TOOL_ERASER
                 self.submenu_open = None
-            self.submenu_items = []
+                self.submenu_items = []
+            else:
+                # Already selected — toggle submenu
+                if self.submenu_open == "eraser_options":
+                    self.submenu_open = None
+                else:
+                    self.submenu_open = "eraser_options"
+                self.submenu_items = []
         elif name in tool_names:
             self._select_tool(name)
             self.submenu_open = None
@@ -1116,6 +1167,8 @@ class ScreenDrawWindow(Gtk.Window):
             self._redo()
         elif name == "clear":
             self._clear_canvas()
+        elif name == "cursor":
+            self._enter_passthrough()
         elif name == "close":
             self._hide_overlay()
         self.queue_draw()
@@ -1133,6 +1186,8 @@ class ScreenDrawWindow(Gtk.Window):
         self.current_tool = tool
         self.submenu_open = None
         self.submenu_items = []
+        if self._passthrough_mode:
+            self._exit_passthrough()
         self.queue_draw()
 
     def _undo(self):
@@ -1158,28 +1213,98 @@ class ScreenDrawWindow(Gtk.Window):
     # ── Visibility ────────────────────────────────────────────────────────
 
     def _toggle_overlay(self):
-        if self.is_visible:
+        if self._passthrough_mode:
+            self._exit_passthrough()
+        elif self.is_visible:
             self._hide_overlay()
         else:
             self._show_overlay()
 
     def _show_overlay(self):
         self.is_visible = True
+        self.set_keep_above(True)
         self.show_all()
         self.present()
         window = self.get_window()
         if window:
             cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
             window.set_cursor(cursor)
+        # Start periodic keep-alive to re-assert always-on-top
+        self._start_focus_keepalive()
 
     def _hide_overlay(self):
         self.is_visible = False
+        self._passthrough_mode = False
         self.submenu_open = None
         self.submenu_items = []
+        self._stop_focus_keepalive()
+        # Reset input shape before hiding
+        window = self.get_window()
+        if window:
+            region = cairo.Region(cairo.RectangleInt(0, 0, self.mon_width, self.mon_height))
+            window.input_shape_combine_region(region, 0, 0)
         self.hide()
 
+    def _enter_passthrough(self):
+        """Make overlay click-through so the user can interact with content below."""
+        self._passthrough_mode = True
+        self.submenu_open = None
+        self.submenu_items = []
+        window = self.get_window()
+        if window:
+            # Empty region = entire window is click-through
+            region = cairo.Region()
+            window.input_shape_combine_region(region, 0, 0)
+        self.queue_draw()
+
+    def _exit_passthrough(self):
+        """Restore input handling on the overlay."""
+        self._passthrough_mode = False
+        window = self.get_window()
+        if window:
+            # Restore full input region
+            region = cairo.Region(cairo.RectangleInt(0, 0, self.mon_width, self.mon_height))
+            window.input_shape_combine_region(region, 0, 0)
+            cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
+            window.set_cursor(cursor)
+        self.queue_draw()
+
+    def _on_focus_out(self, widget, event):
+        """Re-assert always-on-top when the window loses focus."""
+        if self.is_visible:
+            self.set_keep_above(True)
+            # Re-present on next idle to reclaim top position
+            GLib.idle_add(self._reassert_top)
+        return False
+
+    def _reassert_top(self):
+        """Idle callback to re-assert window on top after focus loss."""
+        if self.is_visible:
+            self.set_keep_above(True)
+            self.present()
+        return False  # don't repeat
+
+    def _start_focus_keepalive(self):
+        """Start a periodic timer that re-asserts keep_above every 500ms."""
+        self._stop_focus_keepalive()
+        self._focus_keepalive_id = GLib.timeout_add(500, self._focus_keepalive_tick)
+
+    def _stop_focus_keepalive(self):
+        """Stop the focus keep-alive timer."""
+        if self._focus_keepalive_id is not None:
+            GLib.source_remove(self._focus_keepalive_id)
+            self._focus_keepalive_id = None
+
+    def _focus_keepalive_tick(self):
+        """Periodic tick to re-assert always-on-top."""
+        if not self.is_visible:
+            self._focus_keepalive_id = None
+            return False  # stop timer
+        self.set_keep_above(True)
+        return True  # keep ticking
+
     def _on_destroy(self, widget):
-        pass
+        self._stop_focus_keepalive()
 
 
 # ─── GNOME Custom Keybinding Setup ───────────────────────────────────────────
@@ -1339,7 +1464,8 @@ def main():
     print("│  Ctrl+Z   Undo                       │")
     print("│  Ctrl+Y   Redo                       │")
     print("│  Ctrl+X   Clear canvas               │")
-    print("│  Esc      Hide overlay               │")
+    print("│  C        Interact mode               │")
+    print("│  Esc      Close submenu                │")
     print("└─────────────────────────────────────┘")
 
     # Handle SIGINT gracefully
