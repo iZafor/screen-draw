@@ -10,6 +10,11 @@ for arg in "$@"; do
     fi
 done
 
+# Auto-detect update if the executable already exists
+if [ -x /usr/local/bin/screen-draw ]; then
+    UPDATE_ONLY=1
+fi
+
 echo "╔══════════════════════════════════════════╗"
 if [ $UPDATE_ONLY -eq 1 ]; then
     echo "║        Screen Draw — Update Script       ║"
@@ -18,6 +23,12 @@ else
 fi
 echo "╚══════════════════════════════════════════╝"
 echo ""
+
+if [ $UPDATE_ONLY -eq 1 ]; then
+    echo "[*] Closing any running instances of Screen Draw..."
+    pkill -f "screen-draw" || true
+    pkill -f "screen_draw.py" || true
+fi
 
 if [ $UPDATE_ONLY -eq 0 ]; then
     # Check if running on Fedora
