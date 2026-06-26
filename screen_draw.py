@@ -1142,6 +1142,7 @@ class ScreenDrawWindow(Gtk.Window):
         else:
             x, y = event.x, event.y
 
+        old_x, old_y = self.mouse_x, self.mouse_y
         self.mouse_x = x
         self.mouse_y = y
 
@@ -1175,8 +1176,9 @@ class ScreenDrawWindow(Gtk.Window):
             return
 
         if self.current_tool == TOOL_ERASER:
-            # Eraser cursor circle — invalidate only the cursor area
+            # Eraser cursor circle — invalidate both old and new cursor areas
             r = self.eraser_radius + 4
+            self._schedule_draw_area(old_x - r, old_y - r, r * 2, r * 2)
             self._schedule_draw_area(x - r, y - r, r * 2, r * 2)
             return
 
