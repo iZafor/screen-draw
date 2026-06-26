@@ -13,6 +13,7 @@ Draw directly over your screen with pens, shapes, and erasers — toggle it on/o
 - **Undo/Redo** support
 - **Clear canvas** shortcut
 - Smooth Bézier curve rendering for freehand strokes
+- **Interact mode**: Click-through the overlay to interact with other apps while keeping the toolbar accessible
 - Dark, floating toolbar with modern glassmorphic design
 - Runs natively on **GNOME/Wayland** (Fedora, Ubuntu, etc.)
 
