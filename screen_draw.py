@@ -1221,6 +1221,9 @@ class ScreenDrawWindow(Gtk.Window):
         tool_names = {TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
 
         if name == "pen":
+            if self._passthrough_mode:
+                self._exit_passthrough()
+            self._cursor_zone = None
             if self.current_tool != TOOL_PEN:
                 # First click: just select the pen, close any open submenu
                 self.current_tool = TOOL_PEN
@@ -1234,6 +1237,9 @@ class ScreenDrawWindow(Gtk.Window):
                     self.submenu_open = "pen_options"
                 self.submenu_items = []
         elif name == "eraser":
+            if self._passthrough_mode:
+                self._exit_passthrough()
+            self._cursor_zone = None
             if self.current_tool != TOOL_ERASER:
                 # First click: just select the eraser, close any open submenu
                 self.current_tool = TOOL_ERASER
