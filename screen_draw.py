@@ -1005,7 +1005,16 @@ class ScreenDrawWindow(Gtk.Window):
 
         # Toolbar
         if self._in_toolbar_zone(y):
+            # Bring app back to focus using the direct interaction timestamp
+            self.present_with_time(event.time)
+            
+            # Clicking the toolbar should generally exit interact mode so the 
+            # user can resume drawing, unless they specifically click a button
+            # that manages passthrough itself.
             btn = self._hit_toolbar(x, y)
+            if not btn and self._passthrough_mode:
+                self._exit_passthrough()
+                
             if btn:
                 # Debounce: ignore duplicate events within 200ms
                 now = event.time  # GDK timestamp in milliseconds
@@ -1017,6 +1026,7 @@ class ScreenDrawWindow(Gtk.Window):
 
         # Submenu
         if self._in_submenu_zone(x, y):
+            self.present_with_time(event.time)
             item = self._hit_submenu(x, y)
             if item:
                 self._handle_submenu_click(item)
