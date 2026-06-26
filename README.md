@@ -1,6 +1,6 @@
 # Screen Draw
 
-A lightweight screen annotation tool for Linux (GNOME/Wayland), inspired by [Gromit-MPX](https://github.com/bk138/gromit-mpx).
+A lightweight screen annotation tool for Linux (GNOME/Wayland).
 
 Draw directly over your screen with pens, shapes, and erasers — toggle it on/off with **F9**.
 

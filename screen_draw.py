@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Screen Draw — A Gromit-MPX inspired screen annotation tool for GNOME/Wayland.
+Screen Draw — A screen annotation tool for GNOME/Wayland.
 
 Draw over your entire screen with pens, erasers, and shapes.
 Toggle the overlay with F9.

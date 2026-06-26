@@ -22,10 +22,28 @@ sudo dnf install -y \
     gtk-layer-shell \
     keybinder3
 
+echo "[*] Installing application..."
+sudo cp screen_draw.py /usr/local/bin/screen-draw
+sudo chmod +x /usr/local/bin/screen-draw
+
+echo "[*] Creating desktop entry..."
+cat <<EOF | sudo tee /usr/share/applications/screen-draw.desktop > /dev/null
+[Desktop Entry]
+Name=Screen Draw
+Comment=Draw annotations over your screen
+Exec=screen-draw
+Icon=applications-graphics
+Terminal=false
+Type=Application
+Categories=Utility;Graphics;
+Keywords=draw;annotate;screen;overlay;
+StartupNotify=false
+EOF
+
 echo ""
-echo "[✓] Dependencies installed successfully!"
+echo "[✓] Screen Draw installed successfully!"
 echo ""
 echo "Usage:"
-echo "  python3 screen_draw.py"
+echo "  Run 'screen-draw' from your app drawer or terminal."
 echo ""
 echo "Press F9 to toggle the drawing overlay."
