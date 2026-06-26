@@ -313,6 +313,7 @@ class ScreenDrawWindow(Gtk.Window):
         self.typing_text = ""
         self._blink_id = None
         self.text_size = 24
+        self.text_color = "#FF3B30"
         self.text_bg_color = "transparent"
 
         # ── UI state ──
@@ -549,7 +550,7 @@ class ScreenDrawWindow(Gtk.Window):
                          extents.height + pad * 2)
             cr.fill()
 
-        r, g, b, a = hex_to_rgba(self.current_color)
+        r, g, b, a = hex_to_rgba(self.text_color)
         cr.set_source_rgba(r, g, b, a)
         
         cr.move_to(self.typing_x, self.typing_y)
@@ -647,10 +648,12 @@ class ScreenDrawWindow(Gtk.Window):
                 is_active = name in tool_names and self.current_tool == name
             is_hover = (self.hover_button == name)
 
+            active_color = self.text_color if name == "text" else self.current_color
+            
             # Button background
             if is_active:
                 rounded_rect(cr, bx + 2, by + 2, bw - 4, bh - 4, 8)
-                r, g, bc, _ = hex_to_rgba(self.current_color, 0.25)
+                r, g, bc, _ = hex_to_rgba(active_color, 0.25)
                 cr.set_source_rgba(r, g, bc, 0.25)
                 cr.fill()
             elif is_hover:
@@ -664,7 +667,7 @@ class ScreenDrawWindow(Gtk.Window):
             # Active indicator dot
             if is_active:
                 cr.arc(bx + bw / 2, by + bh - 2, 2.5, 0, 2 * math.pi)
-                rc, gc, bcc, _ = hex_to_rgba(self.current_color)
+                rc, gc, bcc, _ = hex_to_rgba(active_color)
                 cr.set_source_rgba(rc, gc, bcc, 1)
                 cr.fill()
 
@@ -1120,7 +1123,7 @@ class ScreenDrawWindow(Gtk.Window):
             sy = cur_y
             rc, gc, bc, _ = hex_to_rgba(hex_c)
 
-            if hex_c == self.current_color:
+            if hex_c == self.text_color:
                 cr.new_sub_path()
                 cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
                        SM_COLOR_SWATCH / 2 + 3, 0, 2 * math.pi)
@@ -1143,7 +1146,7 @@ class ScreenDrawWindow(Gtk.Window):
                 cr.stroke()
 
             self.submenu_items.append({
-                "type": "color", "value": hex_c,
+                "type": "text_color", "value": hex_c,
                 "x": sx, "y": sy,
                 "w": SM_COLOR_SWATCH, "h": SM_COLOR_SWATCH,
             })
@@ -1390,7 +1393,7 @@ class ScreenDrawWindow(Gtk.Window):
         if self.is_typing and self.typing_text.strip():
             stroke = TextStroke(
                 self.typing_text, self.typing_x, self.typing_y,
-                self.current_color, self.text_size, self.text_bg_color
+                self.text_color, self.text_size, self.text_bg_color
             )
             self._commit_stroke(stroke)
         self.is_typing = False
@@ -1655,6 +1658,8 @@ class ScreenDrawWindow(Gtk.Window):
             self.stroke_width = item["value"]
         elif item["type"] == "eraser_radius":
             self.eraser_radius = item["value"]
+        elif item["type"] == "text_color":
+            self.text_color = item["value"]
         elif item["type"] == "text_bg_color":
             self.text_bg_color = item["value"]
         elif item["type"] == "text_size":
