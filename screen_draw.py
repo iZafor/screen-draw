@@ -1536,17 +1536,17 @@ class ScreenDrawDBusService:
 
 def main():
     print("┌─────────────────────────────────────┐")
-    print("│  Screen Draw — Annotation Overlay    │")
+    print("│  Screen Draw — Annotation Overlay   │")
     print("├─────────────────────────────────────┤")
-    print("│  F9       Toggle overlay             │")
-    print("│  P        Pen tool                   │")
-    print("│  E        Eraser tool                │")
-    print("│  L/R/O/A  Line/Rect/Circle/Arrow     │")
-    print("│  Ctrl+Z   Undo                       │")
-    print("│  Ctrl+Y   Redo                       │")
-    print("│  Ctrl+X   Clear canvas               │")
-    print("│  C        Interact mode               │")
-    print("│  Esc      Close submenu                │")
+    print("│  F9       Toggle overlay            │")
+    print("│  P        Pen tool                  │")
+    print("│  E        Eraser tool               │")
+    print("│  L/R/O/A  Line/Rect/Circle/Arrow    │")
+    print("│  Ctrl+Z   Undo                      │")
+    print("│  Ctrl+Y   Redo                      │")
+    print("│  Ctrl+X   Clear canvas              │")
+    print("│  C        Interact mode             │")
+    print("│  Esc      Close submenu             │")
     print("└─────────────────────────────────────┘")
 
     # Handle SIGINT gracefully

@@ -46,7 +46,7 @@ The app starts hidden. Press **F9** to toggle the drawing overlay.
 
 - **Global Hotkey**: Registered via GNOME custom keybindings (`gsettings`). Pressing F9 triggers a `gdbus` call to the app's D-Bus service.
 - **D-Bus Service**: Exposes `Toggle`, `Show`, `Hide`, and `Quit` methods at `com.tools.ScreenDraw`.
-- **Drawing**: Uses Cairo on a transparent fullscreen GTK window with `DOCK` type hint.
+- **Drawing**: Runs via XWayland (`GDK_BACKEND=x11`) to ensure the transparent overlay can securely stay always-on-top in GNOME Wayland. Uses Cairo on a fullscreen GTK window with `UTILITY` type hint.
 - **Canvas**: Persistent `ImageSurface` with stroke-based undo/redo.
 
 ## Keyboard Shortcuts
@@ -63,7 +63,8 @@ The app starts hidden. Press **F9** to toggle the drawing overlay.
 | `Ctrl+Z`  | Undo                       |
 | `Ctrl+Y`  | Redo                       |
 | `Ctrl+X`  | Clear canvas               |
-| `Escape`  | Hide overlay               |
+| `C`       | Interact (click-through) mode|
+| `Escape`  | Close open submenu         |
 
 ## D-Bus Control
 
