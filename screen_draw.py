@@ -1128,12 +1128,14 @@ class ScreenDrawWindow(Gtk.Window):
                 cr.set_line_width(2)
                 cr.stroke()
 
+            cr.new_path()
             cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
                    SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
             cr.set_source_rgba(rc, gc, bc, 1)
             cr.fill()
 
             if hex_c in ("#FFFFFF", "#FFCC00"):
+                cr.new_path()
                 cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
                        SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
                 cr.set_source_rgba(1, 1, 1, 0.2)
@@ -1170,6 +1172,7 @@ class ScreenDrawWindow(Gtk.Window):
                 cr.stroke()
                 
             if hex_c == "transparent":
+                cr.new_path()
                 cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
                        SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
                 cr.set_source_rgba(0.2, 0.2, 0.2, 1)
@@ -1180,12 +1183,14 @@ class ScreenDrawWindow(Gtk.Window):
                 cr.line_to(sx + SM_COLOR_SWATCH - 4, sy + SM_COLOR_SWATCH - 4)
                 cr.stroke()
             else:
+                cr.new_path()
                 rc, gc, bc, _ = hex_to_rgba(hex_c)
                 cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
                        SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
                 cr.set_source_rgba(rc, gc, bc, 1)
                 cr.fill()
                 if hex_c in ("#FFFFFF", "#FFCC00"):
+                    cr.new_path()
                     cr.arc(sx + SM_COLOR_SWATCH / 2, sy + SM_COLOR_SWATCH / 2,
                            SM_COLOR_SWATCH / 2, 0, 2 * math.pi)
                     cr.set_source_rgba(1, 1, 1, 0.2)
@@ -1525,10 +1530,7 @@ class ScreenDrawWindow(Gtk.Window):
             if keyname in ("Return", "KP_Enter"):
                 self._commit_text()
             elif keyname == "Escape":
-                self.is_typing = False
-                self.typing_text = ""
-                self._stop_cursor_blink()
-                self._schedule_draw()
+                self._commit_text()
             elif keyname == "BackSpace":
                 self.typing_text = self.typing_text[:-1]
                 self._schedule_draw()
