@@ -65,6 +65,7 @@ TOOL_LINE = "line"
 TOOL_RECT = "rect"
 TOOL_CIRCLE = "circle"
 TOOL_ARROW = "arrow"
+TOOL_TEXT = "text"
 
 COLOR_PRESETS = [
     ("#FF3B30", "Red"),
@@ -228,6 +229,25 @@ class ShapeStroke:
                 cr.stroke()
 
 
+class TextStroke:
+    """A text stroke."""
+
+    def __init__(self, text, x, y, color, font_size):
+        self.text = text
+        self.x, self.y = x, y
+        self.color = color
+        self.font_size = font_size
+
+    def draw(self, cr):
+        r, g, b, a = hex_to_rgba(self.color)
+        cr.set_source_rgba(r, g, b, a)
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(self.font_size)
+        cr.move_to(self.x, self.y)
+        cr.show_text(self.text)
+
+
 # ─── Main Application ────────────────────────────────────────────────────────
 
 class ScreenDrawApp(Gtk.Application):
@@ -272,6 +292,13 @@ class ScreenDrawWindow(Gtk.Window):
         self.stroke_width = 5
         self.eraser_radius = 16
         self.is_visible = False
+
+        # ── Text state ──
+        self.is_typing = False
+        self.typing_x = 0
+        self.typing_y = 0
+        self.typing_text = ""
+        self._blink_id = None
 
         # ── UI state ──
         self.submenu_open = None   # "pen_options" | "eraser_options" | None
@@ -365,6 +392,7 @@ class ScreenDrawWindow(Gtk.Window):
             ("pen",    "Pen (P)",       True),
             ("eraser", "Eraser (E)",    False),
             ("__sep",  "",              False),
+            ("text",   "Text (T)",      False),
             ("line",   "Line (L)",      False),
             ("rect",   "Rectangle (R)", False),
             ("circle", "Circle (O)",    False),
@@ -468,6 +496,9 @@ class ScreenDrawWindow(Gtk.Window):
         if self.is_drawing:
             self._draw_current_stroke(cr)
 
+        if self.is_typing:
+            self._draw_typing_text(cr)
+
         # Eraser cursor circle
         if self.current_tool == TOOL_ERASER and not self.is_drawing and not self._passthrough_mode:
             cr.set_source_rgba(1, 1, 1, 0.5)
@@ -484,6 +515,27 @@ class ScreenDrawWindow(Gtk.Window):
             self._draw_pen_submenu(cr, w)
         elif self.submenu_open == "eraser_options":
             self._draw_eraser_submenu(cr, w)
+
+    def _draw_typing_text(self, cr):
+        font_size = 14 + self.stroke_width * 2
+        cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(font_size)
+        r, g, b, a = hex_to_rgba(self.current_color)
+        cr.set_source_rgba(r, g, b, a)
+        
+        cr.move_to(self.typing_x, self.typing_y)
+        if self.typing_text:
+            cr.show_text(self.typing_text)
+            
+        extents = cr.text_extents(self.typing_text) if self.typing_text else cr.text_extents("")
+        cursor_x = self.typing_x + extents.x_advance
+        cursor_y = self.typing_y
+        
+        if int(time.time() * 2) % 2 == 0:
+            cr.move_to(cursor_x, cursor_y)
+            cr.line_to(cursor_x, cursor_y - font_size * 0.8)
+            cr.set_line_width(2)
+            cr.stroke()
 
     def _draw_current_stroke(self, cr):
         """Render the stroke currently being drawn."""
@@ -550,7 +602,7 @@ class ScreenDrawWindow(Gtk.Window):
         cr.stroke()
 
         # Buttons
-        tool_names = {TOOL_PEN, TOOL_ERASER, TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
+        tool_names = {TOOL_PEN, TOOL_ERASER, TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW, TOOL_TEXT}
         for b in self.toolbar_buttons:
             name = b["name"]
             if name.startswith("__sep"):
@@ -594,7 +646,15 @@ class ScreenDrawWindow(Gtk.Window):
         cr.set_line_width(2)
         cx, cy = x + w / 2, y + h / 2
 
-        if name == "pen":
+        if name == "text":
+            cr.set_source_rgba(1, 1, 1, alpha)
+            cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(20)
+            ext = cr.text_extents("T")
+            cr.move_to(cx - ext.width / 2 - ext.x_bearing, cy - ext.height / 2 - ext.y_bearing)
+            cr.show_text("T")
+
+        elif name == "pen":
             cr.set_source_rgba(1, 1, 1, alpha)
             # Pen body (angled rectangle)
             cr.save()
@@ -751,9 +811,14 @@ class ScreenDrawWindow(Gtk.Window):
         """Draw color and stroke width picker below the pen button."""
         pen_btn = None
         for b in self.toolbar_buttons:
-            if b["name"] == "pen":
+            if b["name"] == self.current_tool:
                 pen_btn = b
                 break
+        if not pen_btn:
+            for b in self.toolbar_buttons:
+                if b["name"] == "pen":
+                    pen_btn = b
+                    break
         if not pen_btn:
             return
 
@@ -1016,6 +1081,8 @@ class ScreenDrawWindow(Gtk.Window):
                 self._exit_passthrough()
                 
             if btn:
+                if self.is_typing:
+                    self._commit_text()
                 # Debounce: ignore duplicate events within 200ms
                 now = event.time  # GDK timestamp in milliseconds
                 if now - self._last_toolbar_click_time < 200:
@@ -1038,6 +1105,20 @@ class ScreenDrawWindow(Gtk.Window):
             self.submenu_items = []
             if self._passthrough_mode:
                 self._update_input_shape()
+            self._schedule_draw()
+            return
+
+        if self.is_typing:
+            self._commit_text()
+            if self.current_tool != TOOL_TEXT:
+                return
+
+        if self.current_tool == TOOL_TEXT:
+            self.is_typing = True
+            self.typing_x = x
+            self.typing_y = y
+            self.typing_text = ""
+            self._start_cursor_blink()
             self._schedule_draw()
             return
 
@@ -1087,6 +1168,19 @@ class ScreenDrawWindow(Gtk.Window):
         cr = cairo.Context(self.canvas_surface)
         stroke.draw(cr)
 
+    def _commit_text(self):
+        if self.is_typing and self.typing_text.strip():
+            font_size = 14 + self.stroke_width * 2
+            stroke = TextStroke(
+                self.typing_text, self.typing_x, self.typing_y,
+                self.current_color, font_size
+            )
+            self._commit_stroke(stroke)
+        self.is_typing = False
+        self.typing_text = ""
+        self._stop_cursor_blink()
+        self._schedule_draw()
+
     # ── Cached Cursor Management ───────────────────────────────────────────
 
     def _get_cursor(self, name):
@@ -1101,6 +1195,8 @@ class ScreenDrawWindow(Gtk.Window):
             zone = "toolbar"
         elif self.current_tool == TOOL_ERASER:
             zone = "eraser"
+        elif self.current_tool == TOOL_TEXT:
+            zone = "text"
         else:
             zone = "canvas"
 
@@ -1108,8 +1204,24 @@ class ScreenDrawWindow(Gtk.Window):
             self._cursor_zone = zone
             window = self.get_window()
             if window:
-                cursor_name = {"toolbar": "default", "eraser": "cell", "canvas": "crosshair"}[zone]
+                cursor_name = {"toolbar": "default", "eraser": "cell", "text": "text", "canvas": "crosshair"}[zone]
                 window.set_cursor(self._get_cursor(cursor_name))
+
+    def _start_cursor_blink(self):
+        self._stop_cursor_blink()
+        self._blink_id = GLib.timeout_add(500, self._on_blink_tick)
+
+    def _stop_cursor_blink(self):
+        if self._blink_id is not None:
+            GLib.source_remove(self._blink_id)
+            self._blink_id = None
+
+    def _on_blink_tick(self):
+        if self.is_typing:
+            self._schedule_draw()
+            return True
+        self._blink_id = None
+        return False
 
     # ── Batched Draw Scheduling ───────────────────────────────────────────
 
@@ -1188,6 +1300,37 @@ class ScreenDrawWindow(Gtk.Window):
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         keyname = Gdk.keyval_name(keyval)
 
+        if self.is_typing:
+            if ctrl:
+                if keyname in ("z", "Z"):
+                    self._commit_text()
+                    self._undo()
+                elif keyname in ("y", "Y"):
+                    self._commit_text()
+                    self._redo()
+                return
+                
+            if keyname in ("Return", "KP_Enter"):
+                self._commit_text()
+            elif keyname == "Escape":
+                self.is_typing = False
+                self.typing_text = ""
+                self._stop_cursor_blink()
+                self._schedule_draw()
+            elif keyname == "BackSpace":
+                self.typing_text = self.typing_text[:-1]
+                self._schedule_draw()
+            elif keyname == "space":
+                self.typing_text += " "
+                self._schedule_draw()
+            else:
+                uni = Gdk.keyval_to_unicode(keyval)
+                if uni:
+                    if uni >= 32 and uni != 127:
+                        self.typing_text += chr(uni)
+                        self._schedule_draw()
+            return
+
         if keyname == TOGGLE_KEY:
             self._toggle_overlay()
         elif keyname == "Escape":
@@ -1206,6 +1349,8 @@ class ScreenDrawWindow(Gtk.Window):
             self._select_tool(TOOL_PEN)
         elif not ctrl and keyname in ("e", "E"):
             self._select_tool(TOOL_ERASER)
+        elif not ctrl and keyname in ("t", "T"):
+            self._select_tool(TOOL_TEXT)
         elif not ctrl and keyname in ("l", "L"):
             self._select_tool(TOOL_LINE)
         elif not ctrl and keyname in ("r", "R"):
@@ -1220,7 +1365,7 @@ class ScreenDrawWindow(Gtk.Window):
     # ── Actions ───────────────────────────────────────────────────────────
 
     def _handle_toolbar_click(self, name):
-        tool_names = {TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW}
+        tool_names = {TOOL_LINE, TOOL_RECT, TOOL_CIRCLE, TOOL_ARROW, TOOL_TEXT}
 
         if name == "pen":
             if self._passthrough_mode:
@@ -1233,6 +1378,20 @@ class ScreenDrawWindow(Gtk.Window):
                 self.submenu_items = []
             else:
                 # Already selected — toggle submenu
+                if self.submenu_open == "pen_options":
+                    self.submenu_open = None
+                else:
+                    self.submenu_open = "pen_options"
+                self.submenu_items = []
+        elif name == "text":
+            if self._passthrough_mode:
+                self._exit_passthrough()
+            self._cursor_zone = None
+            if self.current_tool != TOOL_TEXT:
+                self.current_tool = TOOL_TEXT
+                self.submenu_open = None
+                self.submenu_items = []
+            else:
                 if self.submenu_open == "pen_options":
                     self.submenu_open = None
                 else:
@@ -1285,6 +1444,8 @@ class ScreenDrawWindow(Gtk.Window):
         self._schedule_draw()
 
     def _select_tool(self, tool):
+        if self.is_typing:
+            self._commit_text()
         self.current_tool = tool
         self.submenu_open = None
         self.submenu_items = []
@@ -1594,6 +1755,7 @@ def main():
     print("│  F9       Toggle overlay            │")
     print("│  P        Pen tool                  │")
     print("│  E        Eraser tool               │")
+    print("│  T        Text tool                 │")
     print("│  L/R/O/A  Line/Rect/Circle/Arrow    │")
     print("│  Ctrl+Z   Undo                      │")
     print("│  Ctrl+Y   Redo                      │")

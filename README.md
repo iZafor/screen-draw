@@ -9,6 +9,7 @@ Draw directly over your screen with pens, shapes, and erasers — toggle it on/o
 - **Toggle overlay** with `F9` (via GNOME custom keybindings + D-Bus)
 - **Pen tool** with customizable color and stroke width (click pen icon for options)
 - **Eraser tool** with visual cursor circle
+- **Text tool** for adding text annotations with customizable color and font size
 - **Predefined shapes**: Rectangle, Circle, Arrow, Line
 - **Undo/Redo** support
 - **Clear canvas** shortcut
@@ -57,6 +58,7 @@ The app starts hidden. Press **F9** to toggle the drawing overlay.
 | `F9`      | Toggle overlay (global)    |
 | `P`       | Pen tool                   |
 | `E`       | Eraser tool                |
+| `T`       | Text tool                  |
 | `L`       | Line shape                 |
 | `R`       | Rectangle shape            |
 | `O`       | Circle/oval shape          |
