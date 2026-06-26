@@ -1784,6 +1784,15 @@ class ScreenDrawWindow(Gtk.Window):
             window.set_cursor(self._get_cursor("crosshair"))
         self._cursor_zone = None  # force cursor zone re-evaluation
         self._schedule_draw()
+        
+        # Mutter can sometimes drop keyboard focus when the X11 input shape changes.
+        # Requesting focus on the next idle frame ensures it sticks.
+        def _reclaim_focus():
+            if self.is_visible:
+                self.present()
+                self.grab_focus()
+            return False
+        GLib.idle_add(_reclaim_focus)
 
     def _on_focus_out(self, widget, event):
         """Re-assert always-on-top when the window loses focus."""
