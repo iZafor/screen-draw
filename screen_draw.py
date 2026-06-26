@@ -9,6 +9,7 @@ Toggle the overlay with F9.
 import os
 import sys
 import math
+import time
 import signal
 import subprocess
 import warnings
@@ -283,6 +284,16 @@ class ScreenDrawWindow(Gtk.Window):
         # ── Focus-keepalive timer ──
         self._focus_keepalive_id = None
 
+        # ── Event system state ──
+        self._draw_scheduled = False       # whether an idle-draw is pending
+        self._cached_toolbar_width = -1    # last width used for toolbar layout
+        self._cursor_zone = None           # "toolbar"|"eraser"|"canvas" — avoid redundant cursor sets
+        self._cursors = {}                 # cached Gdk.Cursor objects
+        self._min_point_dist_sq = 4.0      # min squared distance between freehand points (2px)
+        self._last_motion_time = 0.0       # for motion coalescing
+        self._motion_coalesce_id = None    # pending motion idle handler
+        self._pending_motion_xy = None     # latest unprocessed motion (x, y)
+
         # ── Setup ──
         self._setup_window()
         self._build_toolbar()
@@ -371,7 +382,11 @@ class ScreenDrawWindow(Gtk.Window):
             })
 
     def _layout_toolbar(self, width):
-        """Position toolbar buttons centered horizontally."""
+        """Position toolbar buttons centered horizontally (cached)."""
+        if width == self._cached_toolbar_width:
+            return  # layout unchanged, skip recalculation
+        self._cached_toolbar_width = width
+
         total_w = 0
         for b in self.toolbar_buttons:
             if b["name"].startswith("__sep"):
@@ -1005,7 +1020,7 @@ class ScreenDrawWindow(Gtk.Window):
         if self.submenu_open:
             self.submenu_open = None
             self.submenu_items = []
-            self.queue_draw()
+            self._schedule_draw()
             return
 
         # Start drawing
@@ -1046,7 +1061,7 @@ class ScreenDrawWindow(Gtk.Window):
         self.current_points = []
         self.shape_start = None
         self.shape_end = None
-        self.queue_draw()
+        self._schedule_draw()
 
     def _commit_stroke(self, stroke):
         self.strokes.append(stroke)
@@ -1054,42 +1069,98 @@ class ScreenDrawWindow(Gtk.Window):
         cr = cairo.Context(self.canvas_surface)
         stroke.draw(cr)
 
+    # ── Cached Cursor Management ───────────────────────────────────────────
+
+    def _get_cursor(self, name):
+        """Get a cached Gdk.Cursor by name, creating it on first access."""
+        if name not in self._cursors:
+            self._cursors[name] = Gdk.Cursor.new_from_name(self.get_display(), name)
+        return self._cursors[name]
+
+    def _update_cursor_zone(self, x, y):
+        """Update the cursor only if the zone has changed."""
+        if self._in_toolbar_zone(y) or self._in_submenu_zone(x, y):
+            zone = "toolbar"
+        elif self.current_tool == TOOL_ERASER:
+            zone = "eraser"
+        else:
+            zone = "canvas"
+
+        if zone != self._cursor_zone:
+            self._cursor_zone = zone
+            window = self.get_window()
+            if window:
+                cursor_name = {"toolbar": "default", "eraser": "cell", "canvas": "crosshair"}[zone]
+                window.set_cursor(self._get_cursor(cursor_name))
+
+    # ── Batched Draw Scheduling ───────────────────────────────────────────
+
+    def _schedule_draw(self):
+        """Schedule a single draw on the next idle, coalescing multiple requests."""
+        if not self._draw_scheduled:
+            self._draw_scheduled = True
+            GLib.idle_add(self._do_scheduled_draw)
+
+    def _do_scheduled_draw(self):
+        """Execute the batched draw."""
+        self._draw_scheduled = False
+        self.queue_draw()
+        return False  # don't repeat
+
+    def _schedule_draw_area(self, x, y, w, h):
+        """Invalidate a specific rectangular region instead of the full window."""
+        self.queue_draw_area(int(x), int(y), int(w), int(h))
+
+    # ── Motion Event Handling (Coalesced) ─────────────────────────────────
+
     def _on_motion(self, widget, event):
-        x, y = event.x, event.y
+        """Handle motion events with coalescing for high-frequency input."""
+        # Get the latest pointer position (coalesce intermediate events)
+        window = event.window
+        if window and self.is_drawing:
+            # Use get_pointer to skip to the latest position
+            _, x, y, _ = window.get_pointer()
+            x, y = float(x), float(y)
+        else:
+            x, y = event.x, event.y
+
         self.mouse_x = x
         self.mouse_y = y
-        needs_redraw = False
 
-        # Hover
+        # Hover detection (toolbar only)
         old_hover = self.hover_button
         hit = self._hit_toolbar(x, y) if self._in_toolbar_zone(y) else None
         self.hover_button = hit["name"] if hit else None
-        if self.hover_button != old_hover:
-            needs_redraw = True
 
-        # Update cursor
-        window = self.get_window()
-        if window:
-            if self._in_toolbar_zone(y) or self._in_submenu_zone(x, y):
-                cursor = Gdk.Cursor.new_from_name(self.get_display(), "default")
-            elif self.current_tool == TOOL_ERASER:
-                cursor = Gdk.Cursor.new_from_name(self.get_display(), "cell")
-            else:
-                cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
-            window.set_cursor(cursor)
+        # Update cursor zone (cached — only changes cursor on zone transitions)
+        self._update_cursor_zone(x, y)
 
         if self.is_drawing:
             if self.current_tool in (TOOL_PEN, TOOL_ERASER):
+                # Point distance filtering: skip points too close together
+                if self.current_points:
+                    lx, ly = self.current_points[-1]
+                    dx, dy = x - lx, y - ly
+                    if dx * dx + dy * dy < self._min_point_dist_sq:
+                        return  # skip this point, too close
                 self.current_points.append((x, y))
             else:
                 self.shape_end = (x, y)
-            needs_redraw = True
+            self._schedule_draw()
+            return
+
+        # Non-drawing updates
+        needs_redraw = False
+        if self.hover_button != old_hover:
+            # Invalidate only the toolbar area for hover changes
+            self._schedule_draw_area(0, 0, self.mon_width, TOOLBAR_HEIGHT + 5)
+            return
 
         if self.current_tool == TOOL_ERASER:
-            needs_redraw = True  # need to redraw cursor circle
-
-        if needs_redraw:
-            self.queue_draw()
+            # Eraser cursor circle — invalidate only the cursor area
+            r = self.eraser_radius + 4
+            self._schedule_draw_area(x - r, y - r, r * 2, r * 2)
+            return
 
     def _on_key_press(self, widget, event):
         keyval = event.keyval
@@ -1104,7 +1175,7 @@ class ScreenDrawWindow(Gtk.Window):
             if self.submenu_open:
                 self.submenu_open = None
                 self.submenu_items = []
-                self.queue_draw()
+                self._schedule_draw()
         elif ctrl and keyname in ("z", "Z"):
             self._undo()
         elif ctrl and keyname in ("y", "Y"):
@@ -1171,7 +1242,7 @@ class ScreenDrawWindow(Gtk.Window):
             self._enter_passthrough()
         elif name == "close":
             self._hide_overlay()
-        self.queue_draw()
+        self._schedule_draw()
 
     def _handle_submenu_click(self, item):
         if item["type"] == "color":
@@ -1180,21 +1251,22 @@ class ScreenDrawWindow(Gtk.Window):
             self.stroke_width = item["value"]
         elif item["type"] == "eraser_radius":
             self.eraser_radius = item["value"]
-        self.queue_draw()
+        self._schedule_draw()
 
     def _select_tool(self, tool):
         self.current_tool = tool
         self.submenu_open = None
         self.submenu_items = []
+        self._cursor_zone = None  # force cursor update for new tool
         if self._passthrough_mode:
             self._exit_passthrough()
-        self.queue_draw()
+        self._schedule_draw()
 
     def _undo(self):
         if self.strokes:
             self.redo_stack.append(self.strokes.pop())
             self._rebuild_canvas()
-            self.queue_draw()
+            self._schedule_draw()
 
     def _redo(self):
         if self.redo_stack:
@@ -1202,13 +1274,13 @@ class ScreenDrawWindow(Gtk.Window):
             self.strokes.append(stroke)
             cr = cairo.Context(self.canvas_surface)
             stroke.draw(cr)
-            self.queue_draw()
+            self._schedule_draw()
 
     def _clear_canvas(self):
         self.strokes.clear()
         self.redo_stack.clear()
         self._rebuild_canvas()
-        self.queue_draw()
+        self._schedule_draw()
 
     # ── Visibility ────────────────────────────────────────────────────────
 
@@ -1227,8 +1299,7 @@ class ScreenDrawWindow(Gtk.Window):
         self.present()
         window = self.get_window()
         if window:
-            cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
-            window.set_cursor(cursor)
+            window.set_cursor(self._get_cursor("crosshair"))
         # Start periodic keep-alive to re-assert always-on-top
         self._start_focus_keepalive()
 
@@ -1255,7 +1326,7 @@ class ScreenDrawWindow(Gtk.Window):
             # Empty region = entire window is click-through
             region = cairo.Region()
             window.input_shape_combine_region(region, 0, 0)
-        self.queue_draw()
+        self._schedule_draw()
 
     def _exit_passthrough(self):
         """Restore input handling on the overlay."""
@@ -1265,9 +1336,9 @@ class ScreenDrawWindow(Gtk.Window):
             # Restore full input region
             region = cairo.Region(cairo.RectangleInt(0, 0, self.mon_width, self.mon_height))
             window.input_shape_combine_region(region, 0, 0)
-            cursor = Gdk.Cursor.new_from_name(self.get_display(), "crosshair")
-            window.set_cursor(cursor)
-        self.queue_draw()
+            window.set_cursor(self._get_cursor("crosshair"))
+        self._cursor_zone = None  # force cursor zone re-evaluation
+        self._schedule_draw()
 
     def _on_focus_out(self, widget, event):
         """Re-assert always-on-top when the window loses focus."""
