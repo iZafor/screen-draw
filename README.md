@@ -23,23 +23,23 @@ Draw directly over your screen with pens, shapes, and erasers — toggle it on/o
 - GTK 3 (`python3-gobject`, `gtk3`)
 - GNOME desktop (for custom keybinding registration)
 
-### Install dependencies (Fedora)
+## Installation (Fedora)
 
-```bash
-sudo dnf install -y python3-gobject gtk3
-```
-
-Or use the install script:
+Run the included installation script to install dependencies, copy the app to `/usr/local/bin`, and create a desktop entry:
 
 ```bash
 ./install.sh
 ```
 
-## Usage
+To uninstall the application, run:
 
 ```bash
-python3 screen_draw.py
+./uninstall.sh
 ```
+
+## Usage
+
+Run the app from your application launcher or by executing `screen-draw` in the terminal.
 
 The app starts hidden. Press **F9** to toggle the drawing overlay.
 
