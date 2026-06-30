@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.iZafor.ScreenDraw</id>
+  <name>Screen Draw</name>
+  <summary>Draw annotations over your screen</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.izafor">
+    <name>iZafor</name>
+  </developer>
+  <description>
+    <p>
+      Screen Draw is a lightweight screen annotation tool for GNOME. It provides
+      pens, erasers, text, and simple shapes on a fullscreen overlay.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/iZafor/screen-draw</url>
+  <launchable type="desktop-id">screen-draw.desktop</launchable>
+  <provides>
+    <binary>screen-draw</binary>
+  </provides>
+  <categories>
+    <category>Graphics</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+</component>

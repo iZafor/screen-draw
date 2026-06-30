@@ -38,6 +38,42 @@ To uninstall the application, run:
 ./uninstall.sh
 ```
 
+## AppImage Release
+
+Build an AppImage with:
+
+```bash
+./packaging/appimage/build-appimage.sh
+```
+
+The script creates an AppDir under `build/appimage/` and writes the final AppImage to `dist/`.
+It requires `appimagetool` on `PATH`; download it from the AppImage project releases if your distribution does not package it.
+
+You can set the release version explicitly:
+
+```bash
+VERSION=1.0.0 ./packaging/appimage/build-appimage.sh
+```
+
+For offline or CI builds, the script also accepts `APPIMAGETOOL=/path/to/appimagetool`, `APPIMAGE_RUNTIME_FILE=/path/to/runtime`, and `APPIMAGE_NO_APPSTREAM_CHECK=1`.
+
+The AppImage uses the host system's Python, GTK 3, PyGObject, and pycairo packages. This keeps the bundle small and avoids shipping distro-specific GNOME/GTK libraries that can conflict with the desktop session. Users still need the runtime packages installed:
+
+```bash
+# Fedora
+sudo dnf install python3-gobject python3-cairo gtk3
+
+# Ubuntu/Debian
+sudo apt install python3-gi python3-cairo gir1.2-gtk-3.0
+```
+
+Run the AppImage directly:
+
+```bash
+chmod +x Screen_Draw-*.AppImage
+./Screen_Draw-*.AppImage
+```
+
 ## Usage
 
 Run the app from your application launcher or by executing `screen-draw` in the terminal.

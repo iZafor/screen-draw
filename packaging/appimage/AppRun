@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APPDIR="$(dirname "$(readlink -f "$0")")"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Screen Draw requires python3 on the host system." >&2
+    exit 1
+fi
+
+python3 - <<'PY'
+import sys
+
+missing = []
+try:
+    import cairo  # noqa: F401
+except Exception:
+    missing.append("python3-cairo")
+
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gtk, Gdk, Gio  # noqa: F401
+except Exception:
+    missing.append("PyGObject/GTK 3")
+
+if missing:
+    print("Screen Draw is missing host dependencies: " + ", ".join(missing), file=sys.stderr)
+    print("Install GTK 3, PyGObject, and pycairo for your distribution.", file=sys.stderr)
+    sys.exit(1)
+PY
+
+exec python3 "$APPDIR/usr/bin/screen-draw" "$@"

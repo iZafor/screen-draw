@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Screen Draw
+Comment=Draw annotations over your screen
+Exec=screen-draw
+Icon=screen-draw
+Terminal=false
+Type=Application
+Categories=Graphics;
+Keywords=draw;annotate;screen;overlay;
+StartupNotify=false
