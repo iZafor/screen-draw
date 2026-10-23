@@ -18,6 +18,8 @@ case "$ARCH" in
         ;;
 esac
 
+make -C "$ROOT_DIR"
+
 rm -rf "$APPDIR"
 mkdir -p \
     "$APPDIR/usr/bin" \
@@ -26,7 +28,7 @@ mkdir -p \
     "$APPDIR/usr/share/metainfo" \
     "$DIST_DIR"
 
-cp "$ROOT_DIR/screen_draw.py" "$APPDIR/usr/bin/screen-draw"
+cp "$ROOT_DIR/screen-draw" "$APPDIR/usr/bin/screen-draw"
 cp "$ROOT_DIR/packaging/appimage/AppRun" "$APPDIR/AppRun"
 cp "$ROOT_DIR/packaging/appimage/screen-draw.desktop" "$APPDIR/screen-draw.desktop"
 cp "$ROOT_DIR/packaging/appimage/screen-draw.desktop" "$APPDIR/usr/share/applications/screen-draw.desktop"

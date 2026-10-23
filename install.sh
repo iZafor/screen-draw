@@ -40,14 +40,18 @@ if [ $UPDATE_ONLY -eq 0 ]; then
 
     echo "[*] Installing dependencies..."
     sudo dnf install -y \
-        python3-gobject \
-        gtk3 \
-        gtk-layer-shell \
-        keybinder3
+        gcc-c++ \
+        make \
+        pkgconf-pkg-config \
+        gtk3-devel \
+        cairo-devel
 fi
 
-echo "[*] Copying application files..."
-sudo cp screen_draw.py /usr/local/bin/screen-draw
+echo "[*] Building native C++ binary..."
+make
+
+echo "[*] Copying application binary..."
+sudo cp screen-draw /usr/local/bin/screen-draw
 sudo chmod +x /usr/local/bin/screen-draw
 
 if [ $UPDATE_ONLY -eq 0 ]; then
