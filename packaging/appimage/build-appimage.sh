@@ -30,8 +30,8 @@ mkdir -p \
 
 cp "$ROOT_DIR/screen-draw" "$APPDIR/usr/bin/screen-draw"
 cp "$ROOT_DIR/packaging/appimage/AppRun" "$APPDIR/AppRun"
-cp "$ROOT_DIR/packaging/appimage/screen-draw.desktop" "$APPDIR/screen-draw.desktop"
-cp "$ROOT_DIR/packaging/appimage/screen-draw.desktop" "$APPDIR/usr/share/applications/screen-draw.desktop"
+cp "$ROOT_DIR/packaging/appimage/io.github.iZafor.ScreenDraw.desktop" "$APPDIR/io.github.iZafor.ScreenDraw.desktop"
+cp "$ROOT_DIR/packaging/appimage/io.github.iZafor.ScreenDraw.desktop" "$APPDIR/usr/share/applications/io.github.iZafor.ScreenDraw.desktop"
 cp "$ROOT_DIR/packaging/appimage/screen-draw.svg" "$APPDIR/screen-draw.svg"
 cp "$ROOT_DIR/packaging/appimage/screen-draw.svg" "$APPDIR/usr/share/icons/hicolor/scalable/apps/screen-draw.svg"
 cp "$ROOT_DIR/packaging/appimage/io.github.iZafor.ScreenDraw.metainfo.xml" "$APPDIR/usr/share/metainfo/io.github.iZafor.ScreenDraw.metainfo.xml"

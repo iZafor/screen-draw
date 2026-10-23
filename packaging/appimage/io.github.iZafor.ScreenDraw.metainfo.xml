@@ -15,7 +15,7 @@
     </p>
   </description>
   <url type="homepage">https://github.com/iZafor/screen-draw</url>
-  <launchable type="desktop-id">screen-draw.desktop</launchable>
+  <launchable type="desktop-id">io.github.iZafor.ScreenDraw.desktop</launchable>
   <provides>
     <binary>screen-draw</binary>
   </provides>
