@@ -104,6 +104,7 @@ The app starts hidden. Press **F9** to toggle the drawing overlay.
 | `O`               | Circle/oval shape                           |
 | `A`               | Arrow shape                                 |
 | `Delete`/`BackSpace` | Delete currently selected shape          |
+| `Ctrl+BackSpace`  | Delete previous word while typing text      |
 | `Ctrl+Z`          | Undo                                        |
 | `Ctrl+Y`          | Redo                                        |
 | `Ctrl+X`          | Clear canvas                                |

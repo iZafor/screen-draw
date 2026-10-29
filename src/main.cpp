@@ -2761,6 +2761,13 @@ public:
                 } else if (kname == "y" || kname == "Y") {
                     commit_text();
                     redo();
+                } else if (kname == "BackSpace" && !typing_text.empty()) {
+                    // Delete the previous word: trailing whitespace, then the word before it.
+                    // Whole runs of bytes are removed, so multi-byte UTF-8 characters stay intact.
+                    auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\n'; };
+                    while (!typing_text.empty() && is_space(typing_text.back())) typing_text.pop_back();
+                    while (!typing_text.empty() && !is_space(typing_text.back())) typing_text.pop_back();
+                    invalidate_full();
                 }
                 return true;
             }
