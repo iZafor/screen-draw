@@ -1,7 +1,7 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra
-PKG_CFLAGS := $(shell pkg-config --cflags gtk+-3.0 cairo gio-2.0)
-PKG_LIBS   := $(shell pkg-config --libs gtk+-3.0 cairo gio-2.0) -lm
+PKG_CFLAGS := $(shell pkg-config --cflags cairo x11 xext xrandr)
+PKG_LIBS   := $(shell pkg-config --libs cairo x11 xext xrandr) -lm
 
 TARGET   := screen-draw
 SRC      := src/main.cpp

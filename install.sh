@@ -43,8 +43,10 @@ if [ $UPDATE_ONLY -eq 0 ]; then
         gcc-c++ \
         make \
         pkgconf-pkg-config \
-        gtk3-devel \
-        cairo-devel
+        cairo-devel \
+        libX11-devel \
+        libXext-devel \
+        libXrandr-devel
 fi
 
 echo "[*] Building native C++ binary..."

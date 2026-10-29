@@ -1,37 +1,58 @@
-// Screen Draw — Native C++17 / GTK3 / Cairo Screen Annotation Overlay
+// Screen Draw — Native C++17 / Xlib / Cairo Screen Annotation Overlay
 // Fast, hardware-composited, dirty-region optimized UI with movable & resizable shapes.
+// No GTK / GLib dependency: talks to the X server (or XWayland) directly via Xlib.
 
-#include <gtk/gtk.h>
-#include <gdk/gdk.h>
-#include <gdk/gdkkeysyms.h>
-#include <gio/gio.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/keysym.h>
+#include <X11/cursorfont.h>
+#include <X11/extensions/shape.h>
+#include <X11/extensions/XShm.h>
+#include <X11/extensions/Xrandr.h>
 #include <cairo.h>
 
+// Xlib's `None` macro collides with HandleId::None below.
+static constexpr unsigned long XNone = None;
+#undef None
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#include <clocale>
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
-// ─── D-Bus Constants ─────────────────────────────────────────────────────────
+// ─── IPC Constants ───────────────────────────────────────────────────────────
+// A running instance listens on a per-user Unix socket; launching the binary
+// again (optionally with --toggle/--show/--hide/--quit) forwards the command.
 
-static const char* DBUS_NAME  = "com.tools.ScreenDraw";
-static const char* DBUS_PATH  = "/com/tools/ScreenDraw";
-static const char* DBUS_IFACE = "com.tools.ScreenDraw";
+static std::string ipc_socket_path() {
+    const char* rt = std::getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) return std::string(rt) + "/screen-draw.sock";
+    return "/tmp/screen-draw-" + std::to_string((unsigned long)getuid()) + ".sock";
+}
 
-static const char* DBUS_XML =
-    "<node>"
-    "  <interface name='com.tools.ScreenDraw'>"
-    "    <method name='Toggle'/>"
-    "    <method name='Show'/>"
-    "    <method name='Hide'/>"
-    "    <method name='Quit'/>"
-    "  </interface>"
-    "</node>";
+static int64_t monotonic_us() {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 static const char* GS_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys";
 static const char* GS_KEY = "custom-keybindings";
@@ -654,9 +675,42 @@ struct SubmenuItem {
 
 class ScreenDrawWindow {
 public:
-    GtkWidget* window = nullptr;
+    // X11 connection & window
+    Display* dpy = nullptr;
+    int screen_num = 0;
+    Window root = 0;
+    Window window = 0;
+    Visual* visual = nullptr;
+    int depth = 0;
+    Colormap colormap = 0;
+    GC gc = nullptr;
+    XIM xim = nullptr;
+    XIC xic = nullptr;
+    int win_x = 0;
+    int win_y = 0;
     int mon_width = 1920;
     int mon_height = 1080;
+    Time last_event_time = CurrentTime;
+    std::map<unsigned int, Cursor> cursor_cache;
+
+    // Back buffer (shared memory XImage when available, plain XImage otherwise)
+    XImage* back_image = nullptr;
+    XShmSegmentInfo shm_info{};
+    bool back_uses_shm = false;
+    cairo_surface_t* back_surface = nullptr;
+    int back_w = 0;
+    int back_h = 0;
+    cairo_region_t* dirty_region = nullptr;
+
+    // Atoms
+    Atom a_wm_protocols = 0, a_wm_delete = 0, a_net_wm_name = 0, a_utf8 = 0;
+    Atom a_net_wm_state = 0, a_net_wm_state_above = 0, a_net_wm_state_skip_taskbar = 0;
+    Atom a_net_wm_state_skip_pager = 0, a_net_wm_window_type = 0, a_net_wm_window_type_utility = 0;
+    Atom a_net_active_window = 0, a_motif_wm_hints = 0, a_net_wm_pid = 0;
+
+    // Deferred (idle) actions processed after the current event batch
+    bool pending_reclaim_focus = false;
+    bool pending_reassert_top = false;
 
     // Document state & Undo/Redo history (snapshots of items + selection)
     std::vector<DrawItem> strokes;
@@ -690,7 +744,7 @@ public:
     double typing_x = 0.0;
     double typing_y = 0.0;
     std::string typing_text;
-    guint blink_timer_id = 0;
+    int64_t blink_next_us = 0; // 0 = blink timer inactive
     double text_size = 24.0;
     std::string text_color = "#FF3B30";
     std::string text_bg_color = "transparent";
@@ -702,7 +756,7 @@ public:
     std::string hover_button;
     double mouse_x = 0.0;
     double mouse_y = 0.0;
-    guint32 last_toolbar_click_time = 0;
+    Time last_toolbar_click_time = 0;
     bool passthrough_mode = false;
 
     // Offscreen Cairo surfaces for blazing fast rendering
@@ -713,13 +767,14 @@ public:
     int cached_toolbar_width = -1;
 
     // Timers & Cursors
-    guint focus_keepalive_id = 0;
+    int64_t focus_keepalive_next_us = 0; // 0 = keepalive timer inactive
     std::string current_cursor_name;
+    bool has_shape_ext = false;
+    bool quit_requested = false;
 
-    ScreenDrawWindow() {
+    explicit ScreenDrawWindow(Display* display) : dpy(display) {
         setup_window();
         build_toolbar();
-        connect_events();
     }
 
     ~ScreenDrawWindow() {
@@ -727,6 +782,14 @@ public:
         stop_cursor_blink();
         if (canvas_surface) cairo_surface_destroy(canvas_surface);
         if (toolbar_cache_surface) cairo_surface_destroy(toolbar_cache_surface);
+        destroy_back_buffer();
+        if (dirty_region) cairo_region_destroy(dirty_region);
+        if (xic) XDestroyIC(xic);
+        if (xim) XCloseIM(xim);
+        for (auto& kv : cursor_cache) XFreeCursor(dpy, kv.second);
+        if (gc) XFreeGC(dpy, gc);
+        if (window) XDestroyWindow(dpy, window);
+        if (colormap) XFreeColormap(dpy, colormap);
     }
 
     void push_undo_snapshot() {
@@ -738,45 +801,438 @@ public:
     }
 
     void setup_window() {
-        window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-        gtk_window_set_title(GTK_WINDOW(window), "Screen Draw");
+        screen_num = DefaultScreen(dpy);
+        root = RootWindow(dpy, screen_num);
 
-        GdkScreen* screen = gtk_widget_get_screen(window);
-        GdkVisual* visual = gdk_screen_get_rgba_visual(screen);
-        if (visual) {
-            gtk_widget_set_visual(window, visual);
+        auto atom = [&](const char* n) { return XInternAtom(dpy, n, False); };
+        a_wm_protocols = atom("WM_PROTOCOLS");
+        a_wm_delete = atom("WM_DELETE_WINDOW");
+        a_net_wm_name = atom("_NET_WM_NAME");
+        a_utf8 = atom("UTF8_STRING");
+        a_net_wm_state = atom("_NET_WM_STATE");
+        a_net_wm_state_above = atom("_NET_WM_STATE_ABOVE");
+        a_net_wm_state_skip_taskbar = atom("_NET_WM_STATE_SKIP_TASKBAR");
+        a_net_wm_state_skip_pager = atom("_NET_WM_STATE_SKIP_PAGER");
+        a_net_wm_window_type = atom("_NET_WM_WINDOW_TYPE");
+        a_net_wm_window_type_utility = atom("_NET_WM_WINDOW_TYPE_UTILITY");
+        a_net_active_window = atom("_NET_ACTIVE_WINDOW");
+        a_motif_wm_hints = atom("_MOTIF_WM_HINTS");
+        a_net_wm_pid = atom("_NET_WM_PID");
+
+        // 32-bit ARGB visual for a translucent overlay (requires a compositor)
+        XVisualInfo vinfo;
+        if (XMatchVisualInfo(dpy, screen_num, 32, TrueColor, &vinfo)) {
+            visual = vinfo.visual;
+            depth = vinfo.depth;
+        } else {
+            visual = DefaultVisual(dpy, screen_num);
+            depth = DefaultDepth(dpy, screen_num);
+            std::fprintf(stderr, "[!] No 32-bit ARGB visual available; overlay will not be transparent\n");
+        }
+        colormap = XCreateColormap(dpy, root, visual, AllocNone);
+
+        // Geometry of the primary monitor (RandR 1.5), falling back to the whole screen
+        win_x = 0;
+        win_y = 0;
+        mon_width = DisplayWidth(dpy, screen_num);
+        mon_height = DisplayHeight(dpy, screen_num);
+        int rr_event = 0, rr_error = 0, rr_major = 0, rr_minor = 0;
+        if (XRRQueryExtension(dpy, &rr_event, &rr_error) &&
+            XRRQueryVersion(dpy, &rr_major, &rr_minor) &&
+            (rr_major > 1 || (rr_major == 1 && rr_minor >= 5))) {
+            int n = 0;
+            XRRMonitorInfo* mons = XRRGetMonitors(dpy, root, True, &n);
+            if (mons && n > 0) {
+                int pick = 0;
+                for (int i = 0; i < n; ++i) {
+                    if (mons[i].primary) { pick = i; break; }
+                }
+                win_x = mons[pick].x;
+                win_y = mons[pick].y;
+                mon_width = mons[pick].width;
+                mon_height = mons[pick].height;
+            }
+            if (mons) XRRFreeMonitors(mons);
         }
 
-        gtk_widget_set_app_paintable(window, TRUE);
-        gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
-        gtk_window_set_skip_taskbar_hint(GTK_WINDOW(window), TRUE);
-        gtk_window_set_skip_pager_hint(GTK_WINDOW(window), TRUE);
-        gtk_window_set_type_hint(GTK_WINDOW(window), GDK_WINDOW_TYPE_HINT_UTILITY);
-        gtk_window_set_keep_above(GTK_WINDOW(window), TRUE);
-        gtk_window_set_accept_focus(GTK_WINDOW(window), TRUE);
+        XSetWindowAttributes attrs{};
+        attrs.colormap = colormap;
+        attrs.border_pixel = 0;
+        attrs.background_pixel = 0; // fully transparent on an ARGB visual
+        attrs.event_mask = ExposureMask | StructureNotifyMask |
+                           ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+                           KeyPressMask | FocusChangeMask;
+        window = XCreateWindow(dpy, root, win_x, win_y, mon_width, mon_height, 0,
+                               depth, InputOutput, visual,
+                               CWColormap | CWBorderPixel | CWBackPixel | CWEventMask, &attrs);
+        gc = XCreateGC(dpy, window, 0, nullptr);
 
-        GdkDisplay* display = gdk_display_get_default();
-        GdkMonitor* monitor = gdk_display_get_primary_monitor(display);
-        if (!monitor && gdk_display_get_n_monitors(display) > 0) {
-            monitor = gdk_display_get_monitor(display, 0);
+        // Title & class
+        const char* title = "Screen Draw";
+        XStoreName(dpy, window, title);
+        XChangeProperty(dpy, window, a_net_wm_name, a_utf8, 8, PropModeReplace,
+                        (const unsigned char*)title, (int)std::strlen(title));
+        XClassHint class_hint;
+        class_hint.res_name = const_cast<char*>("screen-draw");
+        class_hint.res_class = const_cast<char*>("Screen-draw");
+        XSetClassHint(dpy, window, &class_hint);
+
+        // Fixed position & size
+        XSizeHints* size_hints = XAllocSizeHints();
+        size_hints->flags = USPosition | USSize | PMinSize | PMaxSize;
+        size_hints->x = win_x;
+        size_hints->y = win_y;
+        size_hints->width = size_hints->min_width = size_hints->max_width = mon_width;
+        size_hints->height = size_hints->min_height = size_hints->max_height = mon_height;
+        XSetWMNormalHints(dpy, window, size_hints);
+        XFree(size_hints);
+
+        // Accept keyboard focus
+        XWMHints* wm_hints = XAllocWMHints();
+        wm_hints->flags = InputHint | StateHint;
+        wm_hints->input = True;
+        wm_hints->initial_state = NormalState;
+        XSetWMHints(dpy, window, wm_hints);
+        XFree(wm_hints);
+
+        XSetWMProtocols(dpy, window, &a_wm_delete, 1);
+
+        // Undecorated utility window
+        long motif_hints[5] = {2 /* MWM_HINTS_DECORATIONS */, 0, 0, 0, 0};
+        XChangeProperty(dpy, window, a_motif_wm_hints, a_motif_wm_hints, 32, PropModeReplace,
+                        (unsigned char*)motif_hints, 5);
+        XChangeProperty(dpy, window, a_net_wm_window_type, XA_ATOM, 32, PropModeReplace,
+                        (unsigned char*)&a_net_wm_window_type_utility, 1);
+        long pid = (long)getpid();
+        XChangeProperty(dpy, window, a_net_wm_pid, XA_CARDINAL, 32, PropModeReplace,
+                        (unsigned char*)&pid, 1);
+
+        int shape_event = 0, shape_error = 0;
+        has_shape_ext = XShapeQueryExtension(dpy, &shape_event, &shape_error);
+
+        setup_input_method();
+        ensure_canvas(mon_width, mon_height);
+    }
+
+    void setup_input_method() {
+        // XIM gives us proper UTF-8 text input (layouts, dead keys, compose)
+        if (XSupportsLocale()) {
+            xim = XOpenIM(dpy, nullptr, nullptr, nullptr);
+            if (!xim) {
+                XSetLocaleModifiers("@im=none");
+                xim = XOpenIM(dpy, nullptr, nullptr, nullptr);
+            }
         }
-        if (monitor) {
-            GdkRectangle geom;
-            gdk_monitor_get_geometry(monitor, &geom);
-            mon_width = geom.width;
-            mon_height = geom.height;
-            gtk_window_set_default_size(GTK_WINDOW(window), mon_width, mon_height);
-            gtk_window_move(GTK_WINDOW(window), geom.x, geom.y);
-            gtk_window_resize(GTK_WINDOW(window), mon_width, mon_height);
+        if (!xim) return;
+        xic = XCreateIC(xim,
+                        XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                        XNClientWindow, window,
+                        XNFocusWindow, window,
+                        nullptr);
+        if (!xic) return;
+        long filter_events = 0;
+        if (!XGetICValues(xic, XNFilterEvents, &filter_events, nullptr)) {
+            XWindowAttributes wa;
+            XGetWindowAttributes(dpy, window, &wa);
+            XSelectInput(dpy, window, wa.your_event_mask | filter_events);
+        }
+    }
+
+    // ── X11 Window Management Helpers ─────────────────────────────────────
+
+    void send_wm_message(Atom type, long l0, long l1, long l2, long l3) {
+        XEvent e{};
+        e.xclient.type = ClientMessage;
+        e.xclient.window = window;
+        e.xclient.message_type = type;
+        e.xclient.format = 32;
+        e.xclient.data.l[0] = l0;
+        e.xclient.data.l[1] = l1;
+        e.xclient.data.l[2] = l2;
+        e.xclient.data.l[3] = l3;
+        XSendEvent(dpy, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &e);
+    }
+
+    void set_keep_above() {
+        if (!is_visible) return;
+        send_wm_message(a_net_wm_state, 1 /* _NET_WM_STATE_ADD */, (long)a_net_wm_state_above, 0, 1);
+    }
+
+    void present_window(Time t) {
+        if (!is_visible) return;
+        XRaiseWindow(dpy, window);
+        // Source indication 2 (pager) so the WM honours the request without focus-stealing checks
+        send_wm_message(a_net_active_window, 2, (long)t, 0, 0);
+    }
+
+    void map_window() {
+        // _NET_WM_STATE must be set before mapping (WMs drop it on withdraw)
+        Atom states[3] = {a_net_wm_state_above, a_net_wm_state_skip_taskbar, a_net_wm_state_skip_pager};
+        XChangeProperty(dpy, window, a_net_wm_state, XA_ATOM, 32, PropModeReplace,
+                        (unsigned char*)states, 3);
+        XMoveResizeWindow(dpy, window, win_x, win_y, mon_width, mon_height);
+        XMapRaised(dpy, window);
+    }
+
+    // ── Back Buffer & Presentation ────────────────────────────────────────
+
+    static bool& x_error_trap_flag() {
+        static bool flag = false;
+        return flag;
+    }
+
+    static int trap_x_error(Display*, XErrorEvent*) {
+        x_error_trap_flag() = true;
+        return 0;
+    }
+
+    void destroy_back_buffer() {
+        if (back_surface) {
+            cairo_surface_destroy(back_surface);
+            back_surface = nullptr;
+        }
+        if (back_image) {
+            if (back_uses_shm) {
+                XShmDetach(dpy, &shm_info);
+                XSync(dpy, False);
+                back_image->data = nullptr;
+                XDestroyImage(back_image);
+                shmdt(shm_info.shmaddr);
+            } else {
+                XDestroyImage(back_image); // frees malloc'd pixel data
+            }
+            back_image = nullptr;
+        }
+        back_uses_shm = false;
+        back_w = back_h = 0;
+    }
+
+    bool create_shm_back_buffer(int w, int h) {
+        if (!XShmQueryExtension(dpy)) return false;
+        XImage* img = XShmCreateImage(dpy, visual, depth, ZPixmap, nullptr, &shm_info, w, h);
+        if (!img) return false;
+        if (img->bits_per_pixel != 32) {
+            XDestroyImage(img);
+            return false;
+        }
+        shm_info.shmid = shmget(IPC_PRIVATE, (size_t)img->bytes_per_line * img->height, IPC_CREAT | 0600);
+        if (shm_info.shmid < 0) {
+            XDestroyImage(img);
+            return false;
+        }
+        shm_info.shmaddr = (char*)shmat(shm_info.shmid, nullptr, 0);
+        if (shm_info.shmaddr == (char*)-1) {
+            shmctl(shm_info.shmid, IPC_RMID, nullptr);
+            XDestroyImage(img);
+            return false;
+        }
+        img->data = shm_info.shmaddr;
+        shm_info.readOnly = False;
+
+        XSync(dpy, False);
+        x_error_trap_flag() = false;
+        auto old_handler = XSetErrorHandler(trap_x_error);
+        XShmAttach(dpy, &shm_info);
+        XSync(dpy, False);
+        XSetErrorHandler(old_handler);
+        shmctl(shm_info.shmid, IPC_RMID, nullptr); // freed once both sides detach
+
+        if (x_error_trap_flag()) {
+            img->data = nullptr;
+            XDestroyImage(img);
+            shmdt(shm_info.shmaddr);
+            return false;
+        }
+        back_image = img;
+        back_uses_shm = true;
+        return true;
+    }
+
+    void ensure_back_buffer(int w, int h) {
+        if (back_surface && back_w == w && back_h == h) return;
+        destroy_back_buffer();
+        if (w <= 0 || h <= 0) return;
+
+        if (!create_shm_back_buffer(w, h)) {
+            int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, w);
+            char* data = (char*)std::calloc((size_t)stride * h, 1);
+            back_image = XCreateImage(dpy, visual, depth, ZPixmap, 0, data, w, h, 32, stride);
+            if (!back_image) {
+                std::free(data);
+                return;
+            }
+        }
+        // Cairo's ARGB32 is native-endian; tell Xlib so it can byte-swap for the server if needed
+        static const uint32_t endian_probe = 1;
+        back_image->byte_order = (*(const uint8_t*)&endian_probe == 1) ? LSBFirst : MSBFirst;
+
+        back_surface = cairo_image_surface_create_for_data(
+            (unsigned char*)back_image->data, CAIRO_FORMAT_ARGB32, w, h, back_image->bytes_per_line);
+        back_w = w;
+        back_h = h;
+    }
+
+    void add_dirty_rect(int x, int y, int w, int h) {
+        if (w <= 0 || h <= 0) return;
+        if (!dirty_region) dirty_region = cairo_region_create();
+        cairo_rectangle_int_t r = {x, y, w, h};
+        cairo_region_union_rectangle(dirty_region, &r);
+    }
+
+    // Repaint the accumulated dirty region into the back buffer and push it to the window
+    void present_dirty() {
+        if (!dirty_region || cairo_region_is_empty(dirty_region)) return;
+        if (!is_visible) {
+            cairo_region_destroy(dirty_region);
+            dirty_region = nullptr;
+            return;
         }
 
-        gtk_widget_add_events(window,
-                              GDK_BUTTON_PRESS_MASK |
-                              GDK_BUTTON_RELEASE_MASK |
-                              GDK_POINTER_MOTION_MASK |
-                              GDK_KEY_PRESS_MASK |
-                              GDK_LEAVE_NOTIFY_MASK |
-                              GDK_FOCUS_CHANGE_MASK);
+        int w = mon_width;
+        int h = mon_height;
+        ensure_back_buffer(w, h);
+        if (!back_surface) return;
+
+        cairo_rectangle_int_t bounds = {0, 0, w, h};
+        cairo_region_intersect_rectangle(dirty_region, &bounds);
+        if (cairo_region_num_rectangles(dirty_region) > 24) {
+            // Too fragmented: repaint the bounding box in one go
+            cairo_rectangle_int_t ext;
+            cairo_region_get_extents(dirty_region, &ext);
+            cairo_region_destroy(dirty_region);
+            dirty_region = cairo_region_create_rectangle(&ext);
+        }
+
+        cairo_rectangle_int_t clip_rect;
+        cairo_region_get_extents(dirty_region, &clip_rect);
+        int n = cairo_region_num_rectangles(dirty_region);
+
+        cairo_t* cr = cairo_create(back_surface);
+        for (int i = 0; i < n; ++i) {
+            cairo_rectangle_int_t r;
+            cairo_region_get_rectangle(dirty_region, i, &r);
+            cairo_rectangle(cr, r.x, r.y, r.width, r.height);
+        }
+        cairo_clip(cr);
+        on_draw(cr, w, h, clip_rect);
+        cairo_destroy(cr);
+        cairo_surface_flush(back_surface);
+
+        for (int i = 0; i < n; ++i) {
+            cairo_rectangle_int_t r;
+            cairo_region_get_rectangle(dirty_region, i, &r);
+            if (back_uses_shm) {
+                XShmPutImage(dpy, window, gc, back_image, r.x, r.y, r.x, r.y, r.width, r.height, False);
+            } else {
+                XPutImage(dpy, window, gc, back_image, r.x, r.y, r.x, r.y, r.width, r.height);
+            }
+        }
+        // The server must finish reading shared memory before we draw into it again
+        if (back_uses_shm) XSync(dpy, False);
+
+        cairo_region_destroy(dirty_region);
+        dirty_region = nullptr;
+    }
+
+    // ── Event Dispatch, Idle Work & Timers ────────────────────────────────
+
+    void handle_event(XEvent& ev) {
+        if (XFilterEvent(&ev, XNone)) return; // consumed by the input method
+
+        switch (ev.type) {
+            case Expose:
+                add_dirty_rect(ev.xexpose.x, ev.xexpose.y, ev.xexpose.width, ev.xexpose.height);
+                break;
+            case ConfigureNotify:
+                if (ev.xconfigure.window == window &&
+                    (ev.xconfigure.width != mon_width || ev.xconfigure.height != mon_height)) {
+                    mon_width = ev.xconfigure.width;
+                    mon_height = ev.xconfigure.height;
+                    ensure_canvas(mon_width, mon_height);
+                    if (passthrough_mode) update_input_shape();
+                    invalidate_full();
+                }
+                break;
+            case ButtonPress:
+                last_event_time = ev.xbutton.time;
+                if (ev.xbutton.button == Button1) {
+                    on_button_press(ev.xbutton.x, ev.xbutton.y, ev.xbutton.time);
+                }
+                break;
+            case ButtonRelease:
+                last_event_time = ev.xbutton.time;
+                if (ev.xbutton.button == Button1) {
+                    on_button_release(ev.xbutton.x, ev.xbutton.y);
+                }
+                break;
+            case MotionNotify:
+                last_event_time = ev.xmotion.time;
+                on_motion(ev.xmotion.x, ev.xmotion.y);
+                break;
+            case KeyPress:
+                last_event_time = ev.xkey.time;
+                on_key_press(ev.xkey);
+                break;
+            case FocusIn:
+                if (xic) XSetICFocus(xic);
+                break;
+            case FocusOut:
+                if (xic) XUnsetICFocus(xic);
+                if (ev.xfocus.detail != NotifyInferior && ev.xfocus.detail != NotifyPointer) {
+                    on_focus_out();
+                }
+                break;
+            case ClientMessage:
+                if (ev.xclient.message_type == a_wm_protocols &&
+                    (Atom)ev.xclient.data.l[0] == a_wm_delete) {
+                    quit_requested = true;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    void run_idle() {
+        if (pending_reclaim_focus) {
+            pending_reclaim_focus = false;
+            reclaim_focus();
+        }
+        if (pending_reassert_top) {
+            pending_reassert_top = false;
+            reassert_top();
+        }
+    }
+
+    void run_timers() {
+        int64_t now = monotonic_us();
+        if (blink_next_us && now >= blink_next_us) {
+            if (is_typing) {
+                invalidate_full();
+                blink_next_us = now + 500000;
+            } else {
+                blink_next_us = 0;
+            }
+        }
+        if (focus_keepalive_next_us && now >= focus_keepalive_next_us) {
+            if (is_visible) {
+                set_keep_above();
+                focus_keepalive_next_us = now + 500000;
+            } else {
+                focus_keepalive_next_us = 0;
+            }
+        }
+    }
+
+    // Milliseconds until the next timer fires, or -1 if no timer is active
+    int next_timeout_ms() const {
+        int64_t next = 0;
+        if (blink_next_us) next = blink_next_us;
+        if (focus_keepalive_next_us && (!next || focus_keepalive_next_us < next)) next = focus_keepalive_next_us;
+        if (!next) return -1;
+        int64_t diff = next - monotonic_us();
+        if (diff <= 0) return 0;
+        return (int)((diff + 999) / 1000);
     }
 
     void build_toolbar() {
@@ -900,7 +1356,7 @@ public:
         int r = std::min(mon_width, (int)std::ceil(b.x2) + 4);
         int bot = std::min(mon_height, (int)std::ceil(b.y2) + 4);
         if (r > x && bot > y) {
-            gtk_widget_queue_draw_area(window, x, y, r - x, bot - y);
+            add_dirty_rect(x, y, r - x, bot - y);
         }
     }
 
@@ -912,28 +1368,14 @@ public:
     }
 
     void invalidate_full() {
-        if (window) gtk_widget_queue_draw(window);
+        if (window) add_dirty_rect(0, 0, mon_width, mon_height);
     }
 
     // ── Main Rendering ────────────────────────────────────────────────────
 
-    static gboolean on_draw_cb(GtkWidget* widget, cairo_t* cr, gpointer user_data) {
-        return static_cast<ScreenDrawWindow*>(user_data)->on_draw(widget, cr);
-    }
-
-    gboolean on_draw(GtkWidget* widget, cairo_t* cr) {
-        GtkAllocation alloc;
-        gtk_widget_get_allocation(widget, &alloc);
-        int w = alloc.width;
-        int h = alloc.height;
+    void on_draw(cairo_t* cr, int w, int h, const cairo_rectangle_int_t& clip_rect) {
         ensure_canvas(w, h);
         layout_toolbar(w);
-
-        GdkRectangle clip_rect;
-        bool has_clip = gdk_cairo_get_clip_rectangle(cr, &clip_rect);
-        if (!has_clip) {
-            clip_rect = {0, 0, w, h};
-        }
 
         // 1. Clear dirty region to transparent
         cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
@@ -1005,8 +1447,6 @@ public:
                 draw_text_submenu(cr, w);
             }
         }
-
-        return FALSE;
     }
 
     void draw_typing_text(cairo_t* cr) {
@@ -1037,7 +1477,7 @@ public:
 
         double cursor_x = typing_x + ext.x_advance;
         double cursor_y = typing_y;
-        gint64 now_us = g_get_monotonic_time();
+        int64_t now_us = monotonic_us();
         if (((now_us / 500000) % 2) == 0) {
             cairo_move_to(cr, cursor_x, cursor_y);
             cairo_line_to(cr, cursor_x, cursor_y - text_size * 0.8);
@@ -1848,55 +2288,32 @@ public:
 
     // ── Event Handlers ────────────────────────────────────────────────────
 
-    void connect_events() {
-        g_signal_connect(window, "draw", G_CALLBACK(on_draw_cb), this);
-        g_signal_connect(window, "button-press-event", G_CALLBACK(on_button_press_cb), this);
-        g_signal_connect(window, "button-release-event", G_CALLBACK(on_button_release_cb), this);
-        g_signal_connect(window, "motion-notify-event", G_CALLBACK(on_motion_cb), this);
-        g_signal_connect(window, "key-press-event", G_CALLBACK(on_key_press_cb), this);
-        g_signal_connect(window, "configure-event", G_CALLBACK(on_configure_cb), this);
-        g_signal_connect(window, "focus-out-event", G_CALLBACK(on_focus_out_cb), this);
-    }
-
-    static gboolean on_configure_cb(GtkWidget* /*w*/, GdkEventConfigure* ev, gpointer data) {
-        auto* self = static_cast<ScreenDrawWindow*>(data);
-        self->ensure_canvas(ev->width, ev->height);
-        return FALSE;
-    }
-
-    static gboolean on_button_press_cb(GtkWidget* w, GdkEventButton* ev, gpointer data) {
-        return static_cast<ScreenDrawWindow*>(data)->on_button_press(w, ev);
-    }
-
-    gboolean on_button_press(GtkWidget* /*widget*/, GdkEventButton* ev) {
-        if (ev->type != GDK_BUTTON_PRESS || ev->button != 1) return FALSE;
-        double x = ev->x;
-        double y = ev->y;
+    bool on_button_press(double x, double y, Time time) {
 
         // 1. Toolbar click
         if (in_toolbar_zone(y)) {
-            gtk_window_present_with_time(GTK_WINDOW(window), ev->time);
+            present_window(time);
             const ToolbarButton* btn = hit_toolbar(x, y);
             if (!btn && passthrough_mode) {
                 exit_passthrough();
             }
             if (btn) {
                 if (is_typing) commit_text();
-                if (ev->time - last_toolbar_click_time < 150) return TRUE;
-                last_toolbar_click_time = ev->time;
+                if (time - last_toolbar_click_time < 150) return true;
+                last_toolbar_click_time = time;
                 handle_toolbar_click(btn->name);
             }
-            return TRUE;
+            return true;
         }
 
         // 2. Submenu click
         if (in_submenu_zone(x, y)) {
-            gtk_window_present_with_time(GTK_WINDOW(window), ev->time);
+            present_window(time);
             const SubmenuItem* item = hit_submenu(x, y);
             if (item) {
                 handle_submenu_click(*item);
             }
-            return TRUE;
+            return true;
         }
 
         // 3. Close open submenu if clicking outside
@@ -1905,13 +2322,13 @@ public:
             submenu_items.clear();
             if (passthrough_mode) update_input_shape();
             invalidate_full();
-            return TRUE;
+            return true;
         }
 
         // 4. Commit active text if clicking elsewhere
         if (is_typing) {
             commit_text();
-            if (current_tool != ToolType::Text) return TRUE;
+            if (current_tool != ToolType::Text) return true;
         }
 
         // 5. Check if user clicked a resize handle or body of the currently selected shape!
@@ -1921,11 +2338,11 @@ public:
             HandleId hid = sel.hit_handle(x, y);
             if (hid != HandleId::None) {
                 start_manipulation(selected_index, hid, x, y);
-                return TRUE;
+                return true;
             }
             if (sel.hit_test(x, y, true)) {
                 start_manipulation(selected_index, HandleId::Body, x, y);
-                return TRUE;
+                return true;
             }
         }
 
@@ -1947,7 +2364,7 @@ public:
                 start_manipulation(selected_index, (hid != HandleId::None) ? hid : HandleId::Body, x, y);
             }
             update_cursor(x, y);
-            return TRUE;
+            return true;
         }
 
         // Deselect any previously selected shape when starting a new stroke
@@ -1966,7 +2383,7 @@ public:
             typing_text.clear();
             start_cursor_blink();
             invalidate_full();
-            return TRUE;
+            return true;
         }
 
         // 8. Start drawing Pen, Eraser, or Shape
@@ -1978,7 +2395,7 @@ public:
             shape_start = {x, y};
             shape_end = {x, y};
         }
-        return TRUE;
+        return true;
     }
 
     void start_manipulation(int idx, HandleId hid, double x, double y) {
@@ -1995,12 +2412,7 @@ public:
         update_cursor(x, y);
     }
 
-    static gboolean on_button_release_cb(GtkWidget* w, GdkEventButton* ev, gpointer data) {
-        return static_cast<ScreenDrawWindow*>(data)->on_button_release(w, ev);
-    }
-
-    gboolean on_button_release(GtkWidget* /*widget*/, GdkEventButton* ev) {
-        if (ev->button != 1) return FALSE;
+    bool on_button_release(double ev_x, double ev_y) {
 
         if (is_manipulating) {
             is_manipulating = false;
@@ -2016,11 +2428,11 @@ public:
             if (selected_index >= 0 && selected_index < (int)strokes.size()) {
                 invalidate_bbox(strokes[selected_index].visual_bounds(true));
             }
-            update_cursor(ev->x, ev->y);
-            return TRUE;
+            update_cursor(ev_x, ev_y);
+            return true;
         }
 
-        if (!is_drawing) return FALSE;
+        if (!is_drawing) return false;
         is_drawing = false;
 
         if (current_tool == ToolType::Pen && current_points.size() >= 2) {
@@ -2056,7 +2468,7 @@ public:
                 commit_stroke(item, true);
             } else {
                 // Click without drag on a shape tool: check if user clicked an existing shape to select it!
-                int hit_idx = find_topmost_selectable_at(ev->x, ev->y);
+                int hit_idx = find_topmost_selectable_at(ev_x, ev_y);
                 if (hit_idx >= 0) {
                     selected_index = hit_idx;
                     invalidate_bbox(strokes[selected_index].visual_bounds(true));
@@ -2065,8 +2477,8 @@ public:
         }
 
         current_points.clear();
-        update_cursor(ev->x, ev->y);
-        return TRUE;
+        update_cursor(ev_x, ev_y);
+        return true;
     }
 
     void commit_stroke(const DrawItem& item, bool select_after) {
@@ -2116,13 +2528,7 @@ public:
 
     // ── Motion Handling (Coalesced & Dirty-Rect Optimized) ────────────────
 
-    static gboolean on_motion_cb(GtkWidget* w, GdkEventMotion* ev, gpointer data) {
-        return static_cast<ScreenDrawWindow*>(data)->on_motion(w, ev);
-    }
-
-    gboolean on_motion(GtkWidget* /*widget*/, GdkEventMotion* ev) {
-        double x = ev->x;
-        double y = ev->y;
+    bool on_motion(double x, double y) {
         double old_x = mouse_x;
         double old_y = mouse_y;
         mouse_x = x;
@@ -2143,7 +2549,7 @@ public:
             }
             BBox after_box = strokes[selected_index].visual_bounds(true);
             invalidate_bbox(before_box.united(after_box));
-            return TRUE;
+            return true;
         }
 
         // 2. Active Drawing
@@ -2154,7 +2560,7 @@ public:
                     double ly = current_points.back().y;
                     double dx = x - lx;
                     double dy = y - ly;
-                    if (dx * dx + dy * dy < 3.0) return TRUE;
+                    if (dx * dx + dy * dy < 3.0) return true;
                 }
                 current_points.push_back({x, y});
                 size_t n = current_points.size();
@@ -2188,7 +2594,7 @@ public:
                 double pad = std::max(stroke_width * 4.0, 28.0);
                 invalidate_bbox(prev_box.united(new_box).padded(pad));
             }
-            return TRUE;
+            return true;
         }
 
         // 3. Hover detection on toolbar
@@ -2210,23 +2616,40 @@ public:
             invalidate_bbox(b1.united(b2));
         }
 
-        return TRUE;
+        return true;
     }
 
     // ── Cursor Management ─────────────────────────────────────────────────
 
+    // Map CSS cursor names to X core cursor shapes (Xlib loads themed
+    // versions of these automatically when libXcursor is available).
+    static unsigned int font_cursor_for(const std::string& name) {
+        if (name == "pointer") return XC_hand2;
+        if (name == "move") return XC_fleur;
+        if (name == "nwse-resize") return XC_bottom_right_corner;
+        if (name == "nesw-resize") return XC_bottom_left_corner;
+        if (name == "ns-resize") return XC_sb_v_double_arrow;
+        if (name == "ew-resize") return XC_sb_h_double_arrow;
+        if (name == "cell") return XC_plus;
+        if (name == "text") return XC_xterm;
+        if (name == "default") return XC_left_ptr;
+        return XC_crosshair;
+    }
+
     void set_cursor_by_name(const char* name) {
         if (current_cursor_name == name) return;
         current_cursor_name = name;
-        GdkWindow* gdk_win = gtk_widget_get_window(window);
-        if (!gdk_win) return;
-        GdkDisplay* display = gtk_widget_get_display(window);
-        GdkCursor* cur = gdk_cursor_new_from_name(display, name);
-        if (!cur) {
-            cur = gdk_cursor_new_for_display(display, GDK_CROSSHAIR);
+        if (!window) return;
+        unsigned int shape = font_cursor_for(current_cursor_name);
+        auto it = cursor_cache.find(shape);
+        Cursor cur;
+        if (it != cursor_cache.end()) {
+            cur = it->second;
+        } else {
+            cur = XCreateFontCursor(dpy, shape);
+            cursor_cache[shape] = cur;
         }
-        gdk_window_set_cursor(gdk_win, cur);
-        if (cur) g_object_unref(cur);
+        XDefineCursor(dpy, window, cur);
     }
 
     static const char* cursor_for_handle(HandleId hid) {
@@ -2283,39 +2706,51 @@ public:
     }
 
     // ── Text Cursor Blink Timer ───────────────────────────────────────────
-
-    static gboolean on_blink_cb(gpointer data) {
-        auto* self = static_cast<ScreenDrawWindow*>(data);
-        if (self->is_typing) {
-            self->invalidate_full();
-            return TRUE;
-        }
-        self->blink_timer_id = 0;
-        return FALSE;
-    }
+    // Driven by the main loop (see run_timers / next_timeout_ms).
 
     void start_cursor_blink() {
-        stop_cursor_blink();
-        blink_timer_id = g_timeout_add(500, on_blink_cb, this);
+        blink_next_us = monotonic_us() + 500000;
     }
 
     void stop_cursor_blink() {
-        if (blink_timer_id != 0) {
-            g_source_remove(blink_timer_id);
-            blink_timer_id = 0;
-        }
+        blink_next_us = 0;
     }
 
     // ── Keyboard Shortcuts ────────────────────────────────────────────────
 
-    static gboolean on_key_press_cb(GtkWidget* w, GdkEventKey* ev, gpointer data) {
-        return static_cast<ScreenDrawWindow*>(data)->on_key_press(w, ev);
+    static void append_utf8(std::string& out, uint32_t cp) {
+        if (cp < 0x80) {
+            out += (char)cp;
+        } else if (cp < 0x800) {
+            out += (char)(0xC0 | (cp >> 6));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += (char)(0xE0 | (cp >> 12));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        } else {
+            out += (char)(0xF0 | (cp >> 18));
+            out += (char)(0x80 | ((cp >> 12) & 0x3F));
+            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+            out += (char)(0x80 | (cp & 0x3F));
+        }
     }
 
-    gboolean on_key_press(GtkWidget* /*widget*/, GdkEventKey* ev) {
-        guint keyval = ev->keyval;
-        bool ctrl = (ev->state & GDK_CONTROL_MASK) != 0;
-        const char* keyname = gdk_keyval_name(keyval);
+    bool on_key_press(XKeyEvent& kev) {
+        char buf[128];
+        KeySym keysym = NoSymbol;
+        std::string text; // UTF-8 text produced by this key press (may be empty)
+        if (xic) {
+            Status status = 0;
+            int len = Xutf8LookupString(xic, &kev, buf, sizeof(buf) - 1, &keysym, &status);
+            if (status != XLookupKeySym && status != XLookupBoth) keysym = NoSymbol;
+            if ((status == XLookupChars || status == XLookupBoth) && len > 0) text.assign(buf, len);
+        } else {
+            int len = XLookupString(&kev, buf, sizeof(buf) - 1, &keysym, nullptr);
+            for (int i = 0; i < len; ++i) append_utf8(text, (unsigned char)buf[i]); // Latin-1 → UTF-8
+        }
+        bool ctrl = (kev.state & ControlMask) != 0;
+        const char* keyname = (keysym != NoSymbol) ? XKeysymToString(keysym) : nullptr;
         std::string kname = keyname ? keyname : "";
 
         if (is_typing) {
@@ -2327,7 +2762,7 @@ public:
                     commit_text();
                     redo();
                 }
-                return TRUE;
+                return true;
             }
             if (kname == "Return" || kname == "KP_Enter" || kname == "Escape") {
                 commit_text();
@@ -2341,15 +2776,14 @@ public:
                     invalidate_full();
                 }
             } else {
-                guint32 uni = gdk_keyval_to_unicode(keyval);
-                if (uni >= 32 && uni != 127) {
-                    char buf[8];
-                    int len = g_unichar_to_utf8(uni, buf);
-                    typing_text.append(buf, len);
+                // Accept printable text only (no control characters / DEL)
+                unsigned char first = text.empty() ? 0 : (unsigned char)text[0];
+                if (first >= 32 && first != 127) {
+                    typing_text += text;
                     invalidate_full();
                 }
             }
-            return TRUE;
+            return true;
         }
 
         if (kname == "F9") {
@@ -2396,7 +2830,7 @@ public:
             enter_passthrough();
         }
 
-        return TRUE;
+        return true;
     }
 
     // ── Toolbar & Submenu Actions ─────────────────────────────────────────
@@ -2564,35 +2998,31 @@ public:
     // ── Passthrough & Overlay Visibility ──────────────────────────────────
 
     void update_input_shape() {
-        GdkWindow* gdk_win = gtk_widget_get_window(window);
-        if (!gdk_win) return;
+        if (!window || !has_shape_ext) return;
 
         if (!passthrough_mode) {
-            cairo_rectangle_int_t full_rect = {0, 0, mon_width, mon_height};
-            cairo_region_t* reg = cairo_region_create_rectangle(&full_rect);
-            gdk_window_input_shape_combine_region(gdk_win, reg, 0, 0);
-            cairo_region_destroy(reg);
+            XRectangle full_rect = {0, 0, (unsigned short)mon_width, (unsigned short)mon_height};
+            XShapeCombineRectangles(dpy, window, ShapeInput, 0, 0, &full_rect, 1, ShapeSet, Unsorted);
             return;
         }
 
-        cairo_region_t* reg = cairo_region_create();
+        std::vector<XRectangle> rects;
         BBox tb = toolbar_bounds();
-        cairo_rectangle_int_t tb_rect = {
-            (int)std::floor(tb.x1), 0,
-            (int)std::ceil(tb.width()), (int)TOOLBAR_HEIGHT + 8
+        XRectangle tb_rect = {
+            (short)std::floor(tb.x1), 0,
+            (unsigned short)std::ceil(tb.width()), (unsigned short)(TOOLBAR_HEIGHT + 8)
         };
-        cairo_region_union_rectangle(reg, &tb_rect);
+        rects.push_back(tb_rect);
 
         if (!submenu_open.empty()) {
             int sm_h = 130;
             if (submenu_open == "eraser_options") sm_h = 90;
             else if (submenu_open == "text_options") sm_h = 180;
-            cairo_rectangle_int_t sm_rect = {0, (int)TOOLBAR_HEIGHT, mon_width, sm_h};
-            cairo_region_union_rectangle(reg, &sm_rect);
+            XRectangle sm_rect = {0, (short)TOOLBAR_HEIGHT, (unsigned short)mon_width, (unsigned short)sm_h};
+            rects.push_back(sm_rect);
         }
 
-        gdk_window_input_shape_combine_region(gdk_win, reg, 0, 0);
-        cairo_region_destroy(reg);
+        XShapeCombineRectangles(dpy, window, ShapeInput, 0, 0, rects.data(), (int)rects.size(), ShapeSet, Unsorted);
     }
 
     void toggle_overlay() {
@@ -2607,10 +3037,11 @@ public:
 
     void show_overlay() {
         is_visible = true;
-        gtk_window_set_keep_above(GTK_WINDOW(window), TRUE);
-        gtk_widget_show_all(window);
-        gtk_window_present(GTK_WINDOW(window));
+        map_window();
+        present_window(last_event_time);
+        current_cursor_name.clear();
         update_cursor(mouse_x, mouse_y);
+        invalidate_full();
         start_focus_keepalive();
     }
 
@@ -2623,7 +3054,7 @@ public:
         toolbar_cache_dirty = true;
         stop_focus_keepalive();
         update_input_shape();
-        gtk_widget_hide(window);
+        XWithdrawWindow(dpy, window, screen_num);
     }
 
     void enter_passthrough() {
@@ -2637,13 +3068,10 @@ public:
         invalidate_full();
     }
 
-    static gboolean reclaim_focus_cb(gpointer data) {
-        auto* self = static_cast<ScreenDrawWindow*>(data);
-        if (self->is_visible) {
-            gtk_window_present(GTK_WINDOW(self->window));
-            gtk_widget_grab_focus(self->window);
+    void reclaim_focus() {
+        if (is_visible) {
+            present_window(last_event_time);
         }
-        return FALSE;
     }
 
     void exit_passthrough() {
@@ -2653,80 +3081,114 @@ public:
         current_cursor_name.clear();
         update_cursor(mouse_x, mouse_y);
         invalidate_full();
-        g_idle_add(reclaim_focus_cb, this);
+        pending_reclaim_focus = true;
     }
 
-    static gboolean reassert_top_cb(gpointer data) {
-        auto* self = static_cast<ScreenDrawWindow*>(data);
-        if (self->is_visible) {
-            gtk_window_set_keep_above(GTK_WINDOW(self->window), TRUE);
-            GdkWindow* gdk_win = gtk_widget_get_window(self->window);
-            if (gdk_win) gdk_window_raise(gdk_win);
+    void reassert_top() {
+        if (is_visible) {
+            set_keep_above();
+            XRaiseWindow(dpy, window);
         }
-        return FALSE;
     }
 
-    static gboolean on_focus_out_cb(GtkWidget* /*w*/, GdkEventFocus* /*ev*/, gpointer data) {
-        auto* self = static_cast<ScreenDrawWindow*>(data);
-        if (self->is_visible) {
-            gtk_window_set_keep_above(GTK_WINDOW(self->window), TRUE);
-            g_idle_add(reassert_top_cb, self);
+    void on_focus_out() {
+        if (is_visible) {
+            set_keep_above();
+            pending_reassert_top = true;
         }
-        return FALSE;
-    }
-
-    static gboolean focus_keepalive_cb(gpointer data) {
-        auto* self = static_cast<ScreenDrawWindow*>(data);
-        if (!self->is_visible) {
-            self->focus_keepalive_id = 0;
-            return FALSE;
-        }
-        gtk_window_set_keep_above(GTK_WINDOW(self->window), TRUE);
-        return TRUE;
     }
 
     void start_focus_keepalive() {
-        stop_focus_keepalive();
-        focus_keepalive_id = g_timeout_add(500, focus_keepalive_cb, this);
+        focus_keepalive_next_us = monotonic_us() + 500000;
     }
 
     void stop_focus_keepalive() {
-        if (focus_keepalive_id != 0) {
-            g_source_remove(focus_keepalive_id);
-            focus_keepalive_id = 0;
-        }
+        focus_keepalive_next_us = 0;
     }
 };
 
 // ─── GNOME Custom Keybinding Setup ───────────────────────────────────────────
 
+static bool program_on_path(const char* prog) {
+    return std::system((std::string("command -v ") + prog + " >/dev/null 2>&1").c_str()) == 0;
+}
+
 static void run_cmd(const std::vector<std::string>& args) {
-    std::vector<char*> argv;
-    for (const auto& s : args) argv.push_back(const_cast<char*>(s.c_str()));
-    argv.push_back(nullptr);
-    gint exit_status = 0;
-    g_spawn_sync(nullptr, argv.data(), nullptr,
-                 (GSpawnFlags)(G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL),
-                 nullptr, nullptr, nullptr, nullptr, &exit_status, nullptr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        std::vector<char*> argv;
+        for (const auto& s : args) argv.push_back(const_cast<char*>(s.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    if (pid > 0) {
+        int status = 0;
+        waitpid(pid, &status, 0);
+    }
+}
+
+static std::string capture_cmd(const std::string& cmd) {
+    std::string out;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return out;
+    char buf[512];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
+    pclose(p);
+    return out;
+}
+
+static std::string shell_quote(const std::string& s) {
+    std::string q = "'";
+    for (char c : s) {
+        if (c == '\'') q += "'\\''";
+        else q += c;
+    }
+    q += "'";
+    return q;
+}
+
+// Command the desktop should run to toggle the overlay of the running instance
+static std::string toggle_command() {
+    std::string exe;
+    if (const char* appimage = std::getenv("APPIMAGE")) {
+        exe = appimage;
+    } else {
+        char buf[4096];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            exe = buf;
+        }
+    }
+    if (exe.empty()) return "screen-draw --toggle";
+
+    // Prefer the bare name when it resolves to this very binary via PATH
+    std::string on_path = capture_cmd("command -v screen-draw 2>/dev/null");
+    while (!on_path.empty() && (on_path.back() == '\n' || on_path.back() == '\r')) on_path.pop_back();
+    if (!on_path.empty()) {
+        char a[4096], b[4096];
+        if (realpath(on_path.c_str(), a) && realpath(exe.c_str(), b) && std::strcmp(a, b) == 0) {
+            return "screen-draw --toggle";
+        }
+    }
+    return shell_quote(exe) + " --toggle";
 }
 
 static void setup_global_hotkey() {
-    std::string toggle_cmd =
-        std::string("gdbus call --session --dest ") + DBUS_NAME +
-        " --object-path " + DBUS_PATH +
-        " --method " + DBUS_IFACE + ".Toggle";
+    if (!program_on_path("gsettings")) return;
 
-    gchar* stdout_str = nullptr;
-    const gchar* get_argv[] = {"gsettings", "get", GS_SCHEMA, GS_KEY, nullptr};
-    if (!g_spawn_sync(nullptr, const_cast<gchar**>(get_argv), nullptr,
-                      G_SPAWN_SEARCH_PATH, nullptr, nullptr,
-                      &stdout_str, nullptr, nullptr, nullptr) || !stdout_str) {
-        return;
-    }
+    std::string current = capture_cmd(std::string("gsettings get ") + GS_SCHEMA + " " + GS_KEY + " 2>/dev/null");
+    if (current.empty()) return; // not a GNOME session / schema missing
 
-    std::string current(stdout_str);
-    g_free(stdout_str);
-
+    std::string toggle_cmd = toggle_command();
     std::string new_path = std::string(KEYBINDING_PATH_PREFIX) + KEYBINDING_SLOT + "/";
     std::string schema_path = std::string(GS_CUSTOM_SCHEMA) + ":" + new_path;
 
@@ -2762,90 +3224,100 @@ static void setup_global_hotkey() {
     std::printf("[\u2713] F9 hotkey registered via GNOME custom keybindings\n");
 }
 
-// ─── D-Bus Service ───────────────────────────────────────────────────────────
+// ─── Single-Instance IPC (Unix socket) ───────────────────────────────────────
 
-struct AppContext {
-    GApplication* app = nullptr;
-    std::unique_ptr<ScreenDrawWindow> win;
-    GDBusNodeInfo* node_info = nullptr;
-    guint owner_id = 0;
-};
-
-static void on_dbus_method_call(GDBusConnection* /*conn*/,
-                                const gchar* /*sender*/,
-                                const gchar* /*object_path*/,
-                                const gchar* /*interface_name*/,
-                                const gchar* method_name,
-                                GVariant* /*parameters*/,
-                                GDBusMethodInvocation* invocation,
-                                gpointer user_data) {
-    auto* ctx = static_cast<AppContext*>(user_data);
-    std::string m = method_name ? method_name : "";
-    if (m == "Toggle" && ctx->win) {
-        ctx->win->toggle_overlay();
-    } else if (m == "Show" && ctx->win) {
-        ctx->win->show_overlay();
-    } else if (m == "Hide" && ctx->win) {
-        ctx->win->hide_overlay();
-    } else if (m == "Quit" && ctx->app) {
-        g_application_quit(ctx->app);
-    }
-    g_dbus_method_invocation_return_value(invocation, nullptr);
+static bool fill_sockaddr(sockaddr_un& addr, const std::string& path) {
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(addr.sun_path)) return false;
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+    return true;
 }
 
-static const GDBusInterfaceVTable dbus_vtable = {
-    on_dbus_method_call,
-    nullptr,
-    nullptr,
-    {nullptr}
-};
-
-static gboolean initial_hide_cb(gpointer data) {
-    auto* win = static_cast<ScreenDrawWindow*>(data);
-    win->hide_overlay();
-    return FALSE;
+// Returns true if a running instance accepted the command
+static bool send_ipc_command(const std::string& cmd) {
+    sockaddr_un addr;
+    if (!fill_sockaddr(addr, ipc_socket_path())) return false;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return false;
+    if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return false;
+    }
+    std::string msg = cmd + "\n";
+    ssize_t sent = send(fd, msg.data(), msg.size(), MSG_NOSIGNAL);
+    close(fd);
+    return sent == (ssize_t)msg.size();
 }
 
-static void on_app_activate(GApplication* app, gpointer user_data) {
-    auto* ctx = static_cast<AppContext*>(user_data);
-    if (!ctx->win) {
-        g_application_hold(app);
-        ctx->win = std::make_unique<ScreenDrawWindow>();
-        g_signal_connect_swapped(ctx->win->window, "destroy", G_CALLBACK(g_application_release), app);
-        gtk_widget_show_all(ctx->win->window);
-        g_idle_add(initial_hide_cb, ctx->win.get());
-
-        // Register D-Bus object
-        GError* err = nullptr;
-        ctx->node_info = g_dbus_node_info_new_for_xml(DBUS_XML, &err);
-        GDBusConnection* bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
-        if (bus && ctx->node_info) {
-            g_dbus_connection_register_object(
-                bus,
-                DBUS_PATH,
-                ctx->node_info->interfaces[0],
-                &dbus_vtable,
-                ctx,
-                nullptr,
-                nullptr);
-            ctx->owner_id = g_bus_own_name_on_connection(
-                bus,
-                DBUS_NAME,
-                G_BUS_NAME_OWNER_FLAGS_NONE,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr);
-            std::printf("[\u2713] D-Bus service registered\n");
-        }
-    } else {
-        ctx->win->toggle_overlay();
+static int create_ipc_listener(const std::string& path) {
+    sockaddr_un addr;
+    if (!fill_sockaddr(addr, path)) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return -1;
+    unlink(path.c_str()); // remove a stale socket from a crashed instance
+    if (bind(fd, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 8) != 0) {
+        close(fd);
+        return -1;
     }
+    chmod(path.c_str(), 0600);
+    return fd;
+}
+
+static void handle_ipc_client(int listen_fd, ScreenDrawWindow& win) {
+    for (;;) {
+        int cfd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cfd < 0) return;
+        timeval tv = {0, 200000};
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        char buf[64];
+        ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
+        close(cfd);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+        std::string cmd(buf);
+        while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r' || cmd.back() == ' ')) cmd.pop_back();
+
+        if (cmd == "toggle") win.toggle_overlay();
+        else if (cmd == "show") { if (!win.is_visible) win.show_overlay(); else if (win.passthrough_mode) win.exit_passthrough(); }
+        else if (cmd == "hide") { if (win.is_visible) win.hide_overlay(); }
+        else if (cmd == "quit") win.quit_requested = true;
+    }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+static int x_error_handler(Display* d, XErrorEvent* e) {
+    char text[256];
+    XGetErrorText(d, e->error_code, text, sizeof(text));
+    std::fprintf(stderr, "[!] X error: %s (request %d.%d)\n", text, e->request_code, e->minor_code);
+    return 0; // non-fatal, like GDK
+}
+
+static void print_usage(const char* prog) {
+    std::printf("Usage: %s [--toggle | --show | --hide | --quit]\n"
+                "  (no option)  start in the background, or toggle a running instance\n"
+                "  --toggle     toggle the overlay (starts the app if needed)\n"
+                "  --show       show the overlay (starts the app if needed)\n"
+                "  --hide       hide the overlay of a running instance\n"
+                "  --quit       quit a running instance\n", prog);
 }
 
 int main(int argc, char** argv) {
-    // Force X11 backend (XWayland) so fullscreen transparent overlay stays always-on-top on GNOME Wayland
-    setenv("GDK_BACKEND", "x11", 1);
+    std::string command; // "" = plain launch
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--toggle" || a == "-t") command = "toggle";
+        else if (a == "--show") command = "show";
+        else if (a == "--hide") command = "hide";
+        else if (a == "--quit" || a == "-q") command = "quit";
+        else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
+        else { print_usage(argv[0]); return 2; }
+    }
+
+    // Forward to an already running instance (a plain launch toggles it)
+    if (send_ipc_command(command.empty() ? "toggle" : command)) return 0;
+    if (command == "hide" || command == "quit") return 0; // nothing running
 
     std::printf("┌──────────────────────────────────────────┐\n");
     std::printf("│  Screen Draw — Fast Native C++ Overlay   │\n");
@@ -2863,19 +3335,66 @@ int main(int argc, char** argv) {
     std::printf("│  C        Interact mode                  │\n");
     std::printf("│  Esc      Deselect / Close submenu       │\n");
     std::printf("└──────────────────────────────────────────┘\n");
+    std::fflush(stdout);
 
     std::signal(SIGINT, SIG_DFL);
+    std::signal(SIGPIPE, SIG_IGN);
+
+    // Locale for XIM-based UTF-8 text input
+    std::setlocale(LC_CTYPE, "");
+    XSetLocaleModifiers("");
+
+    // Connects to XWayland on GNOME Wayland (via $DISPLAY) so the fullscreen
+    // transparent overlay can stay always-on-top.
+    Display* dpy = XOpenDisplay(nullptr);
+    if (!dpy) {
+        std::fprintf(stderr, "[!] Cannot open X display (is $DISPLAY set? XWayland is required on Wayland)\n");
+        return 1;
+    }
+    XSetErrorHandler(x_error_handler);
+
+    std::string sock_path = ipc_socket_path();
+    int listen_fd = create_ipc_listener(sock_path);
+    if (listen_fd < 0) {
+        std::fprintf(stderr, "[!] Could not create control socket at %s; F9 toggling will not work\n", sock_path.c_str());
+    } else {
+        std::printf("[\u2713] Control socket listening at %s\n", sock_path.c_str());
+    }
+
     setup_global_hotkey();
 
-    GtkApplication* app = gtk_application_new("com.tools.screendraw", G_APPLICATION_DEFAULT_FLAGS);
-    AppContext ctx;
-    ctx.app = G_APPLICATION(app);
+    auto win = std::make_unique<ScreenDrawWindow>(dpy);
+    if (command == "toggle" || command == "show") win->show_overlay();
 
-    g_signal_connect(app, "activate", G_CALLBACK(on_app_activate), &ctx);
-    int status = g_application_run(G_APPLICATION(app), argc, argv);
+    int xfd = ConnectionNumber(dpy);
+    while (!win->quit_requested) {
+        while (XPending(dpy) > 0) {
+            XEvent ev;
+            XNextEvent(dpy, &ev);
+            win->handle_event(ev);
+        }
+        win->run_idle();
+        win->run_timers();
+        win->present_dirty();
+        XFlush(dpy);
+        if (win->quit_requested) break;
+        if (XPending(dpy) > 0) continue;
 
-    if (ctx.owner_id) g_bus_unown_name(ctx.owner_id);
-    if (ctx.node_info) g_dbus_node_info_unref(ctx.node_info);
-    g_object_unref(app);
-    return status;
+        pollfd fds[2];
+        int nfds = 0;
+        fds[nfds++] = {xfd, POLLIN, 0};
+        if (listen_fd >= 0) fds[nfds++] = {listen_fd, POLLIN, 0};
+        int r = poll(fds, nfds, win->next_timeout_ms());
+        if (r > 0 && listen_fd >= 0 && (fds[1].revents & POLLIN)) {
+            handle_ipc_client(listen_fd, *win);
+        }
+    }
+
+    win.reset();
+    if (listen_fd >= 0) {
+        close(listen_fd);
+        unlink(sock_path.c_str());
+    }
+    XCloseDisplay(dpy);
+    return 0;
 }

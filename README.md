@@ -1,13 +1,13 @@
 # Screen Draw
 
-A blazing-fast native C++17 / GTK3 / Cairo screen annotation overlay for Linux (GNOME/Wayland).
+A blazing-fast native C++17 / Xlib / Cairo screen annotation overlay for Linux (GNOME/Wayland via XWayland, or any X11 desktop). No GTK or GLib required.
 
 Draw directly over your screen with pens, shapes, text, and erasers — and freely **move** or **resize** drawn shapes — toggle it on/off with **F9**.
 
 ## Features
 
-- **Native C++17 & Cairo engine**: Offscreen toolbar caching and dirty-region partial invalidation (`gtk_widget_queue_draw_area`) for zero-lag drawing and manipulation at high refresh rates
-- **Toggle overlay** with `F9` (via GNOME custom keybindings + D-Bus)
+- **Native C++17 & Cairo engine**: Offscreen toolbar caching and dirty-region partial invalidation with a shared-memory (MIT-SHM) back buffer for zero-lag drawing and manipulation at high refresh rates
+- **Toggle overlay** with `F9` (via GNOME custom keybindings + `screen-draw --toggle`)
 - **Movable & Resizable Shapes**:
   - **Select / Move & Resize tool (`S` or `V`)**: Click and drag any shape, text, or stroke to move it anywhere on screen
   - **Interactive Resize Handles**: Newly drawn shapes are automatically selected with interactive handles — drag any of the 8 bounding-box handles (`NW`, `N`, `NE`, `E`, `SE`, `S`, `SW`, `W`) on Rectangles, Circles/Ellipses, or Freehand strokes, the 2 endpoint handles on Lines and Arrows, or the 4 corner handles on Text to resize on the fly
@@ -26,8 +26,11 @@ Draw directly over your screen with pens, shapes, text, and erasers — and free
 ## Build Requirements
 
 - C++17 compiler (`g++`) and `make`
-- `pkg-config`, `gtk+-3.0` (`gtk3-devel` / `libgtk-3-dev`), and `cairo`
-- GNOME desktop (for custom keybinding registration)
+- `pkg-config`, `cairo`, `x11`, `xext`, `xrandr`
+  - Fedora: `cairo-devel libX11-devel libXext-devel libXrandr-devel`
+  - Debian/Ubuntu: `libcairo2-dev libx11-dev libxext-dev libxrandr-dev`
+- An X server or XWayland, and a compositor for transparency
+- GNOME desktop (optional, for automatic F9 keybinding registration; on other desktops bind a key to `screen-draw --toggle`)
 
 ## Building & Installation (Fedora)
 
@@ -83,9 +86,9 @@ The app starts hidden. Press **F9** to toggle the drawing overlay.
 
 ## Architecture
 
-- **Global Hotkey**: Registered via GNOME custom keybindings (`gsettings`). Pressing F9 triggers a `gdbus` call to the app's D-Bus service.
-- **D-Bus Service**: Exposes `Toggle`, `Show`, `Hide`, and `Quit` methods at `com.tools.ScreenDraw`.
-- **Drawing & Performance**: Runs in native C++17 via XWayland (`GDK_BACKEND=x11`) so the transparent overlay stays always-on-top in GNOME Wayland. Uses dirty-rectangle clipping (`gdk_cairo_get_clip_rectangle`), an offscreen cached toolbar surface, and an in-place cleared persistent canvas surface.
+- **Global Hotkey**: Registered via GNOME custom keybindings (`gsettings`, if available). Pressing F9 runs `screen-draw --toggle`.
+- **Single-instance control**: The running instance listens on a Unix socket (`$XDG_RUNTIME_DIR/screen-draw.sock`); launching `screen-draw` again forwards `toggle` / `show` / `hide` / `quit` to it.
+- **Drawing & Performance**: Talks to the X server directly with Xlib (XWayland on GNOME Wayland) so the transparent overlay stays always-on-top. Uses a 32-bit ARGB window, accumulated dirty-region repainting into a MIT-SHM back buffer, an offscreen cached toolbar surface, and an in-place cleared persistent canvas surface. Click-through uses the XShape input region.
 
 ## Keyboard Shortcuts
 
@@ -107,20 +110,16 @@ The app starts hidden. Press **F9** to toggle the drawing overlay.
 | `C`               | Interact (click-through) mode               |
 | `Escape`          | Deselect shape / Close open submenu         |
 
-## D-Bus Control
+## Command-Line Control
 
-You can also control Screen Draw programmatically:
+You can also control a running instance from scripts or your own keybindings:
 
 ```bash
-# Toggle the overlay
-gdbus call --session --dest com.tools.ScreenDraw \
-  --object-path /com/tools/ScreenDraw \
-  --method com.tools.ScreenDraw.Toggle
-
-# Quit the app
-gdbus call --session --dest com.tools.ScreenDraw \
-  --object-path /com/tools/ScreenDraw \
-  --method com.tools.ScreenDraw.Quit
+screen-draw            # start in the background (or toggle if already running)
+screen-draw --toggle   # toggle the overlay (starts the app if needed)
+screen-draw --show     # show the overlay
+screen-draw --hide     # hide the overlay
+screen-draw --quit     # quit the running instance
 ```
 
 ## License
