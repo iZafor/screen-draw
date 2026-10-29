@@ -744,6 +744,10 @@ public:
     double typing_x = 0.0;
     double typing_y = 0.0;
     std::string typing_text;
+    int editing_index = -1; // index of an existing Text item being re-edited (-1 = new text)
+    Time last_click_time = 0;
+    double last_click_x = -1000.0;
+    double last_click_y = -1000.0;
     int64_t blink_next_us = 0; // 0 = blink timer inactive
     double text_size = 24.0;
     std::string text_color = "#FF3B30";
@@ -1333,6 +1337,8 @@ public:
 
     void rebuild_canvas(int skip_idx = -1) {
         if (!canvas_surface) return;
+        // Keep a text item that is being edited out of the static canvas (it is drawn as live typing)
+        if (skip_idx < 0 && is_typing && editing_index >= 0) skip_idx = editing_index;
         canvas_skip_index = skip_idx;
         cairo_t* cr = cairo_create(canvas_surface);
         // Clear existing surface in-place without reallocating full-screen memory
@@ -1395,7 +1401,8 @@ public:
 
         // 4. If we are actively moving/resizing a selected item (which was excluded from canvas_surface),
         //    draw it dynamically now!
-        if (canvas_skip_index >= 0 && canvas_skip_index < (int)strokes.size()) {
+        if (canvas_skip_index >= 0 && canvas_skip_index < (int)strokes.size() &&
+            !(is_typing && canvas_skip_index == editing_index)) {
             strokes[canvas_skip_index].draw(cr);
             // If any erasers exist above this stroke in z-order, apply them on top or keep z-order accurate
         }
@@ -2286,6 +2293,56 @@ public:
         return -1;
     }
 
+    int find_topmost_text_at(double x, double y) const {
+        for (int i = (int)strokes.size() - 1; i >= 0; --i) {
+            if (strokes[i].kind == StrokeKind::Text && strokes[i].hit_test(x, y, true)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // ── Text Re-Editing ───────────────────────────────────────────────────
+
+    // Re-open an existing Text item for editing (caret at the end of the text)
+    void begin_edit_text(int idx) {
+        if (idx < 0 || idx >= (int)strokes.size() || strokes[idx].kind != StrokeKind::Text) return;
+        const DrawItem& item = strokes[idx];
+        BBox old_b = item.visual_bounds(true);
+        if (selected_index >= 0 && selected_index < (int)strokes.size()) {
+            invalidate_bbox(strokes[selected_index].visual_bounds(true));
+        }
+
+        is_typing = true;
+        editing_index = idx;
+        typing_x = item.text_x;
+        typing_y = item.text_y;
+        typing_text = item.text;
+        // Adopt the item's style so the text submenu edits it while typing
+        text_color = item.color;
+        text_size = item.font_size;
+        text_bg_color = item.bg_color.empty() ? "transparent" : item.bg_color;
+        selected_index = -1;
+        is_manipulating = false;
+        active_handle = HandleId::None;
+        toolbar_cache_dirty = true;
+
+        rebuild_canvas(idx); // hide the original while it is live-edited
+        start_cursor_blink();
+        invalidate_bbox(old_b);
+        invalidate_full();
+    }
+
+    // Commit any current typing, then edit the topmost text item under (x, y)
+    bool begin_edit_text_at(double x, double y) {
+        if (is_typing) commit_text(); // may remove/reindex items, so hit-test afterwards
+        int idx = find_topmost_text_at(x, y);
+        if (idx < 0) return false;
+        begin_edit_text(idx);
+        update_cursor(x, y);
+        return true;
+    }
+
     // ── Event Handlers ────────────────────────────────────────────────────
 
     bool on_button_press(double x, double y, Time time) {
@@ -2325,13 +2382,24 @@ public:
             return true;
         }
 
-        // 4. Commit active text if clicking elsewhere
+        // 4. Double-click on a text item (any tool) re-opens it for editing
+        bool is_double_click = (time - last_click_time) < 400 &&
+                               std::hypot(x - last_click_x, y - last_click_y) < 6.0;
+        last_click_time = time;
+        last_click_x = x;
+        last_click_y = y;
+        if (is_double_click && begin_edit_text_at(x, y)) {
+            last_click_time = 0; // don't chain into a triple-click
+            return true;
+        }
+
+        // 5. Commit active text if clicking elsewhere
         if (is_typing) {
             commit_text();
             if (current_tool != ToolType::Text) return true;
         }
 
-        // 5. Check if user clicked a resize handle or body of the currently selected shape!
+        // 6. Check if user clicked a resize handle or body of the currently selected shape!
         //    This works both in Select tool AND right after drawing a shape!
         if (selected_index >= 0 && selected_index < (int)strokes.size()) {
             const auto& sel = strokes[selected_index];
@@ -2346,7 +2414,7 @@ public:
             }
         }
 
-        // 6. If in Select tool, check if user clicked any drawn shape to select & move it
+        // 7. If in Select tool, check if user clicked any drawn shape to select & move it
         if (current_tool == ToolType::Select) {
             int hit_idx = find_topmost_selectable_at(x, y);
             if (hit_idx != selected_index) {
@@ -2374,10 +2442,11 @@ public:
             invalidate_bbox(old_b);
         }
 
-        // 7. Text tool
+        // 8. Text tool: click an existing text to edit it, or empty space to start new text
         if (current_tool == ToolType::Text) {
-            // Also allow clicking an existing text or shape in Text mode? If user clicked empty space, start typing:
+            if (begin_edit_text_at(x, y)) return true;
             is_typing = true;
+            editing_index = -1;
             typing_x = x;
             typing_y = y;
             typing_text.clear();
@@ -2386,7 +2455,7 @@ public:
             return true;
         }
 
-        // 8. Start drawing Pen, Eraser, or Shape
+        // 9. Start drawing Pen, Eraser, or Shape
         is_drawing = true;
         if (current_tool == ToolType::Pen || current_tool == ToolType::Eraser) {
             current_points.clear();
@@ -2415,6 +2484,7 @@ public:
     bool on_button_release(double ev_x, double ev_y) {
 
         if (is_manipulating) {
+            HandleId released_handle = active_handle;
             is_manipulating = false;
             active_handle = HandleId::None;
             if (drag_modified && selected_index >= 0 && selected_index < (int)strokes.size()) {
@@ -2427,6 +2497,12 @@ public:
             rebuild_canvas(-1);
             if (selected_index >= 0 && selected_index < (int)strokes.size()) {
                 invalidate_bbox(strokes[selected_index].visual_bounds(true));
+            }
+            // Text tool: a plain click (no drag) on a selected text's body edits it
+            if (!drag_modified && released_handle == HandleId::Body && current_tool == ToolType::Text &&
+                selected_index >= 0 && selected_index < (int)strokes.size() &&
+                strokes[selected_index].kind == StrokeKind::Text) {
+                begin_edit_text(selected_index);
             }
             update_cursor(ev_x, ev_y);
             return true;
@@ -2507,6 +2583,39 @@ public:
                     break;
                 }
             }
+            if (editing_index >= 0 && editing_index < (int)strokes.size()) {
+                // Re-edit of an existing text item: update it in place (or delete it if emptied)
+                int idx = editing_index;
+                editing_index = -1;
+                is_typing = false;
+                DrawItem& item = strokes[idx];
+                BBox old_b = item.visual_bounds(true);
+                if (!has_non_space) {
+                    push_undo_snapshot();
+                    strokes.erase(strokes.begin() + idx);
+                    selected_index = -1;
+                } else {
+                    bool changed = item.text != typing_text || item.color != text_color ||
+                                   item.font_size != text_size || item.bg_color != text_bg_color;
+                    if (changed) {
+                        push_undo_snapshot(); // snapshot holds the pre-edit item
+                        item.text = typing_text;
+                        item.color = text_color;
+                        item.font_size = text_size;
+                        item.bg_color = text_bg_color;
+                        item.text_metrics_valid = false;
+                        item.update_text_metrics();
+                    }
+                    selected_index = idx;
+                }
+                invalidate_bbox(old_b);
+                typing_text.clear();
+                stop_cursor_blink();
+                rebuild_canvas(-1);
+                invalidate_full();
+                return;
+            }
+            editing_index = -1;
             if (has_non_space) {
                 DrawItem item;
                 item.kind = StrokeKind::Text;
@@ -2795,6 +2904,10 @@ public:
 
         if (kname == "F9") {
             toggle_overlay();
+        } else if ((kname == "Return" || kname == "KP_Enter" || kname == "F2") &&
+                   selected_index >= 0 && selected_index < (int)strokes.size() &&
+                   strokes[selected_index].kind == StrokeKind::Text) {
+            begin_edit_text(selected_index);
         } else if (kname == "Escape") {
             if (!submenu_open.empty()) {
                 submenu_open.clear();
