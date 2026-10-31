@@ -744,11 +744,14 @@ public:
     double typing_x = 0.0;
     double typing_y = 0.0;
     std::string typing_text;
+    size_t typing_cursor_pos = 0;
+    bool is_typing_drag = false;
     int editing_index = -1; // index of an existing Text item being re-edited (-1 = new text)
     Time last_click_time = 0;
     double last_click_x = -1000.0;
     double last_click_y = -1000.0;
     int64_t blink_next_us = 0; // 0 = blink timer inactive
+    int64_t blink_base_us = 0;
     double text_size = 24.0;
     std::string text_color = "#FF3B30";
     std::string text_bg_color = "transparent";
@@ -1482,10 +1485,18 @@ public:
             cairo_show_text(cr, typing_text.c_str());
         }
 
-        double cursor_x = typing_x + ext.x_advance;
+        double cursor_x = typing_x;
+        if (typing_cursor_pos > 0) {
+            cairo_text_extents_t cur_ext;
+            size_t safe_pos = std::min(typing_cursor_pos, typing_text.size());
+            std::string sub = typing_text.substr(0, safe_pos);
+            cairo_text_extents(cr, sub.c_str(), &cur_ext);
+            cursor_x += cur_ext.x_advance;
+        }
         double cursor_y = typing_y;
         int64_t now_us = monotonic_us();
-        if (((now_us / 500000) % 2) == 0) {
+        int64_t elapsed_us = (blink_base_us > 0) ? (now_us - blink_base_us) : now_us;
+        if (((elapsed_us / 500000) % 2) == 0) {
             cairo_move_to(cr, cursor_x, cursor_y);
             cairo_line_to(cr, cursor_x, cursor_y - text_size * 0.8);
             cairo_set_line_width(cr, 2.0);
@@ -2302,10 +2313,81 @@ public:
         return -1;
     }
 
+    size_t cursor_index_from_x(const std::string& str, double font_sz, double start_x, double target_x) const {
+        if (str.empty()) return 0;
+
+        cairo_surface_t* tmp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        cairo_t* cr = cairo_create(tmp);
+        cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, font_sz);
+
+        std::vector<size_t> boundaries;
+        boundaries.push_back(0);
+        for (size_t i = 0; i < str.size(); ) {
+            unsigned char c = (unsigned char)str[i];
+            size_t len = 1;
+            if ((c & 0x80) == 0) len = 1;
+            else if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+            if (i + len > str.size()) len = str.size() - i;
+            i += len;
+            boundaries.push_back(i);
+        }
+
+        std::vector<double> positions;
+        positions.reserve(boundaries.size());
+        for (size_t b : boundaries) {
+            if (b == 0) {
+                positions.push_back(start_x);
+            } else {
+                cairo_text_extents_t ext;
+                cairo_text_extents(cr, str.substr(0, b).c_str(), &ext);
+                positions.push_back(start_x + ext.x_advance);
+            }
+        }
+
+        cairo_destroy(cr);
+        cairo_surface_destroy(tmp);
+
+        if (target_x <= positions.front()) return 0;
+        if (target_x >= positions.back()) return str.size();
+
+        for (size_t i = 0; i + 1 < positions.size(); ++i) {
+            double p0 = positions[i];
+            double p1 = positions[i + 1];
+            double mid = (p0 + p1) * 0.5;
+            if (target_x < mid) {
+                return boundaries[i];
+            }
+        }
+        return str.size();
+    }
+
+    BBox typing_visual_bounds() const {
+        if (!is_typing) return {0, 0, 0, 0};
+        cairo_surface_t* tmp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        cairo_t* cr = cairo_create(tmp);
+        cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, text_size);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, typing_text.c_str(), &ext);
+        cairo_destroy(cr);
+        cairo_surface_destroy(tmp);
+
+        double w = std::max({ext.width, ext.x_advance, 14.0});
+        double h = std::max(ext.height, text_size * 0.75);
+        double xb = std::min(ext.x_bearing, 0.0);
+        double yb = (ext.height > 0) ? ext.y_bearing : -text_size * 0.75;
+        double pad = (text_bg_color != "transparent" && !text_bg_color.empty()) ? 8.0 : 4.0;
+        return {typing_x + xb - pad, typing_y + yb - pad,
+                typing_x + xb + w + pad, typing_y + yb + h + pad};
+    }
+
     // ── Text Re-Editing ───────────────────────────────────────────────────
 
-    // Re-open an existing Text item for editing (caret at the end of the text)
-    void begin_edit_text(int idx) {
+    // Re-open an existing Text item for editing
+    void begin_edit_text(int idx, double click_x = -1.0) {
         if (idx < 0 || idx >= (int)strokes.size() || strokes[idx].kind != StrokeKind::Text) return;
         const DrawItem& item = strokes[idx];
         BBox old_b = item.visual_bounds(true);
@@ -2314,10 +2396,16 @@ public:
         }
 
         is_typing = true;
+        is_typing_drag = false;
         editing_index = idx;
         typing_x = item.text_x;
         typing_y = item.text_y;
         typing_text = item.text;
+        if (click_x >= 0) {
+            typing_cursor_pos = cursor_index_from_x(typing_text, item.font_size, typing_x, click_x);
+        } else {
+            typing_cursor_pos = typing_text.size();
+        }
         // Adopt the item's style so the text submenu edits it while typing
         text_color = item.color;
         text_size = item.font_size;
@@ -2338,7 +2426,7 @@ public:
         if (is_typing) commit_text(); // may remove/reindex items, so hit-test afterwards
         int idx = find_topmost_text_at(x, y);
         if (idx < 0) return false;
-        begin_edit_text(idx);
+        begin_edit_text(idx, x);
         update_cursor(x, y);
         return true;
     }
@@ -2393,8 +2481,15 @@ public:
             return true;
         }
 
-        // 5. Commit active text if clicking elsewhere
+        // 5. If typing, clicking inside active text positions the cursor; clicking outside commits
         if (is_typing) {
+            if (typing_visual_bounds().padded(8.0).contains(x, y)) {
+                typing_cursor_pos = cursor_index_from_x(typing_text, text_size, typing_x, x);
+                is_typing_drag = true;
+                start_cursor_blink();
+                invalidate_full();
+                return true;
+            }
             commit_text();
             if (current_tool != ToolType::Text) return true;
         }
@@ -2409,6 +2504,10 @@ public:
                 return true;
             }
             if (sel.hit_test(x, y, true)) {
+                if (current_tool == ToolType::Text && sel.kind == StrokeKind::Text) {
+                    begin_edit_text(selected_index, x);
+                    return true;
+                }
                 start_manipulation(selected_index, HandleId::Body, x, y);
                 return true;
             }
@@ -2446,10 +2545,12 @@ public:
         if (current_tool == ToolType::Text) {
             if (begin_edit_text_at(x, y)) return true;
             is_typing = true;
+            is_typing_drag = false;
             editing_index = -1;
             typing_x = x;
             typing_y = y;
             typing_text.clear();
+            typing_cursor_pos = 0;
             start_cursor_blink();
             invalidate_full();
             return true;
@@ -2482,6 +2583,9 @@ public:
     }
 
     bool on_button_release(double ev_x, double ev_y) {
+        if (is_typing_drag) {
+            is_typing_drag = false;
+        }
 
         if (is_manipulating) {
             HandleId released_handle = active_handle;
@@ -2502,7 +2606,7 @@ public:
             if (!drag_modified && released_handle == HandleId::Body && current_tool == ToolType::Text &&
                 selected_index >= 0 && selected_index < (int)strokes.size() &&
                 strokes[selected_index].kind == StrokeKind::Text) {
-                begin_edit_text(selected_index);
+                begin_edit_text(selected_index, ev_x);
             }
             update_cursor(ev_x, ev_y);
             return true;
@@ -2588,6 +2692,8 @@ public:
                 int idx = editing_index;
                 editing_index = -1;
                 is_typing = false;
+                is_typing_drag = false;
+                typing_cursor_pos = 0;
                 DrawItem& item = strokes[idx];
                 BBox old_b = item.visual_bounds(true);
                 if (!has_non_space) {
@@ -2610,6 +2716,7 @@ public:
                 }
                 invalidate_bbox(old_b);
                 typing_text.clear();
+                typing_cursor_pos = 0;
                 stop_cursor_blink();
                 rebuild_canvas(-1);
                 invalidate_full();
@@ -2630,7 +2737,10 @@ public:
             }
         }
         is_typing = false;
+        is_typing_drag = false;
         typing_text.clear();
+        typing_cursor_pos = 0;
+        editing_index = -1;
         stop_cursor_blink();
         invalidate_full();
     }
@@ -2642,6 +2752,14 @@ public:
         double old_y = mouse_y;
         mouse_x = x;
         mouse_y = y;
+
+        // 0. Dragging text cursor while typing
+        if (is_typing && is_typing_drag) {
+            typing_cursor_pos = cursor_index_from_x(typing_text, text_size, typing_x, x);
+            start_cursor_blink();
+            invalidate_full();
+            return true;
+        }
 
         // 1. Active Move / Resize of a selected shape
         if (is_manipulating && selected_index >= 0 && selected_index < (int)strokes.size()) {
@@ -2787,6 +2905,10 @@ public:
             set_cursor_by_name(cursor_for_handle(active_handle));
             return;
         }
+        if (is_typing && typing_visual_bounds().padded(8.0).contains(x, y)) {
+            set_cursor_by_name("text");
+            return;
+        }
         if (selected_index >= 0 && selected_index < (int)strokes.size()) {
             HandleId hid = strokes[selected_index].hit_handle(x, y);
             if (hid != HandleId::None) {
@@ -2818,11 +2940,13 @@ public:
     // Driven by the main loop (see run_timers / next_timeout_ms).
 
     void start_cursor_blink() {
-        blink_next_us = monotonic_us() + 500000;
+        blink_base_us = monotonic_us();
+        blink_next_us = blink_base_us + 500000;
     }
 
     void stop_cursor_blink() {
         blink_next_us = 0;
+        blink_base_us = 0;
     }
 
     // ── Keyboard Shortcuts ────────────────────────────────────────────────
@@ -2863,6 +2987,8 @@ public:
         std::string kname = keyname ? keyname : "";
 
         if (is_typing) {
+            auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\n'; };
+
             if (ctrl) {
                 if (kname == "z" || kname == "Z") {
                     commit_text();
@@ -2870,32 +2996,131 @@ public:
                 } else if (kname == "y" || kname == "Y") {
                     commit_text();
                     redo();
-                } else if (kname == "BackSpace" && !typing_text.empty()) {
-                    // Delete the previous word: trailing whitespace, then the word before it.
-                    // Whole runs of bytes are removed, so multi-byte UTF-8 characters stay intact.
-                    auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\n'; };
-                    while (!typing_text.empty() && is_space(typing_text.back())) typing_text.pop_back();
-                    while (!typing_text.empty() && !is_space(typing_text.back())) typing_text.pop_back();
+                } else if (kname == "BackSpace") {
+                    if (typing_cursor_pos > 0) {
+                        size_t old_pos = typing_cursor_pos;
+                        while (typing_cursor_pos > 0 && is_space(typing_text[typing_cursor_pos - 1])) {
+                            --typing_cursor_pos;
+                        }
+                        while (typing_cursor_pos > 0 && !is_space(typing_text[typing_cursor_pos - 1])) {
+                            --typing_cursor_pos;
+                            while (typing_cursor_pos > 0 && ((unsigned char)typing_text[typing_cursor_pos] & 0xC0) == 0x80) {
+                                --typing_cursor_pos;
+                            }
+                        }
+                        typing_text.erase(typing_cursor_pos, old_pos - typing_cursor_pos);
+                        start_cursor_blink();
+                        invalidate_full();
+                    }
+                } else if (kname == "Delete" || kname == "KP_Delete") {
+                    if (typing_cursor_pos < typing_text.size()) {
+                        size_t next_pos = typing_cursor_pos;
+                        while (next_pos < typing_text.size() && is_space(typing_text[next_pos])) {
+                            ++next_pos;
+                        }
+                        while (next_pos < typing_text.size() && !is_space(typing_text[next_pos])) {
+                            ++next_pos;
+                            while (next_pos < typing_text.size() && ((unsigned char)typing_text[next_pos] & 0xC0) == 0x80) {
+                                ++next_pos;
+                            }
+                        }
+                        typing_text.erase(typing_cursor_pos, next_pos - typing_cursor_pos);
+                        start_cursor_blink();
+                        invalidate_full();
+                    }
+                } else if (kname == "Left" || kname == "KP_Left") {
+                    while (typing_cursor_pos > 0 && is_space(typing_text[typing_cursor_pos - 1])) {
+                        --typing_cursor_pos;
+                    }
+                    while (typing_cursor_pos > 0 && !is_space(typing_text[typing_cursor_pos - 1])) {
+                        --typing_cursor_pos;
+                        while (typing_cursor_pos > 0 && ((unsigned char)typing_text[typing_cursor_pos] & 0xC0) == 0x80) {
+                            --typing_cursor_pos;
+                        }
+                    }
+                    start_cursor_blink();
+                    invalidate_full();
+                } else if (kname == "Right" || kname == "KP_Right") {
+                    while (typing_cursor_pos < typing_text.size() && !is_space(typing_text[typing_cursor_pos])) {
+                        ++typing_cursor_pos;
+                        while (typing_cursor_pos < typing_text.size() && ((unsigned char)typing_text[typing_cursor_pos] & 0xC0) == 0x80) {
+                            ++typing_cursor_pos;
+                        }
+                    }
+                    while (typing_cursor_pos < typing_text.size() && is_space(typing_text[typing_cursor_pos])) {
+                        ++typing_cursor_pos;
+                    }
+                    start_cursor_blink();
+                    invalidate_full();
+                } else if (kname == "Home" || kname == "KP_Home" || kname == "Up" || kname == "KP_Up") {
+                    typing_cursor_pos = 0;
+                    start_cursor_blink();
+                    invalidate_full();
+                } else if (kname == "End" || kname == "KP_End" || kname == "Down" || kname == "KP_Down") {
+                    typing_cursor_pos = typing_text.size();
+                    start_cursor_blink();
                     invalidate_full();
                 }
                 return true;
             }
+
             if (kname == "Return" || kname == "KP_Enter" || kname == "Escape") {
                 commit_text();
-            } else if (kname == "BackSpace") {
-                if (!typing_text.empty()) {
-                    // Pop last UTF-8 character
-                    while (!typing_text.empty() && (typing_text.back() & 0xC0) == 0x80) {
-                        typing_text.pop_back();
+            } else if (kname == "Left" || kname == "KP_Left") {
+                if (typing_cursor_pos > 0) {
+                    --typing_cursor_pos;
+                    while (typing_cursor_pos > 0 && ((unsigned char)typing_text[typing_cursor_pos] & 0xC0) == 0x80) {
+                        --typing_cursor_pos;
                     }
-                    if (!typing_text.empty()) typing_text.pop_back();
+                    start_cursor_blink();
+                    invalidate_full();
+                }
+            } else if (kname == "Right" || kname == "KP_Right") {
+                if (typing_cursor_pos < typing_text.size()) {
+                    ++typing_cursor_pos;
+                    while (typing_cursor_pos < typing_text.size() && ((unsigned char)typing_text[typing_cursor_pos] & 0xC0) == 0x80) {
+                        ++typing_cursor_pos;
+                    }
+                    start_cursor_blink();
+                    invalidate_full();
+                }
+            } else if (kname == "Home" || kname == "KP_Home" || kname == "Up" || kname == "KP_Up") {
+                typing_cursor_pos = 0;
+                start_cursor_blink();
+                invalidate_full();
+            } else if (kname == "End" || kname == "KP_End" || kname == "Down" || kname == "KP_Down") {
+                typing_cursor_pos = typing_text.size();
+                start_cursor_blink();
+                invalidate_full();
+            } else if (kname == "BackSpace") {
+                if (typing_cursor_pos > 0) {
+                    size_t prev_pos = typing_cursor_pos - 1;
+                    while (prev_pos > 0 && ((unsigned char)typing_text[prev_pos] & 0xC0) == 0x80) {
+                        --prev_pos;
+                    }
+                    typing_text.erase(prev_pos, typing_cursor_pos - prev_pos);
+                    typing_cursor_pos = prev_pos;
+                    start_cursor_blink();
+                    invalidate_full();
+                }
+            } else if (kname == "Delete" || kname == "KP_Delete") {
+                if (typing_cursor_pos < typing_text.size()) {
+                    size_t next_pos = typing_cursor_pos + 1;
+                    while (next_pos < typing_text.size() && ((unsigned char)typing_text[next_pos] & 0xC0) == 0x80) {
+                        ++next_pos;
+                    }
+                    typing_text.erase(typing_cursor_pos, next_pos - typing_cursor_pos);
+                    start_cursor_blink();
                     invalidate_full();
                 }
             } else {
                 // Accept printable text only (no control characters / DEL)
                 unsigned char first = text.empty() ? 0 : (unsigned char)text[0];
                 if (first >= 32 && first != 127) {
-                    typing_text += text;
+                    typing_cursor_pos = std::min(typing_cursor_pos, typing_text.size());
+                    typing_text.insert(typing_cursor_pos, text);
+                    typing_cursor_pos += text.size();
+                    start_cursor_blink();
                     invalidate_full();
                 }
             }

@@ -15,7 +15,9 @@ Draw directly over your screen with pens, shapes, text, and erasers — and free
 - **Pen tool** with customizable color and stroke width (click pen icon for options)
 - **Eraser tool** with live erasing and visual cursor circle
 - **Text tool** for adding text annotations with customizable color, background color, and font size
-  - **Edit existing text**: double-click a text annotation (any tool), click it with the Text tool, or select it and press `Enter` / `F2`. Clearing all its text deletes it; edits are undoable
+  - **Edit existing text**: double-click a text annotation (any tool), click it with the Text tool, or select it and press `Enter` / `F2`. Reopening places the cursor at the exact clicked location
+  - **Full cursor navigation**: click anywhere within the text or drag to position the cursor; navigate with `Left` / `Right` arrows, `Home` / `End` / `Up` / `Down`, and `Ctrl+Left` / `Ctrl+Right` (by word)
+  - **In-place editing & deletion**: edit or insert text at the cursor position; delete with `BackSpace`, `Delete`, `Ctrl+BackSpace`, and `Ctrl+Delete`. Clearing all text removes the item; edits are undoable
 - **Predefined shapes**: Rectangle, Circle/Ellipse, Arrow, Line
 - **Undo/Redo** (`Ctrl+Z` / `Ctrl+Y`) across drawing, moving, resizing, restyling, and deleting
 - **Clear canvas** shortcut (`Ctrl+X`)
@@ -105,7 +107,11 @@ The app starts hidden. Press **F9** to toggle the drawing overlay.
 | `O`               | Circle/oval shape                           |
 | `A`               | Arrow shape                                 |
 | `Delete`/`BackSpace` | Delete currently selected shape          |
-| `Ctrl+BackSpace`  | Delete previous word while typing text      |
+| `Left` / `Right`  | Move cursor 1 character while typing text   |
+| `Ctrl+Left` / `Ctrl+Right` | Move cursor 1 word while typing text |
+| `Home` / `End`    | Move cursor to start / end of text line     |
+| `BackSpace` / `Delete` | Delete character before / after cursor |
+| `Ctrl+BackSpace` / `Ctrl+Delete` | Delete word before / after cursor |
 | `Enter` / `F2`    | Edit the selected text annotation           |
 | `Ctrl+Z`          | Undo                                        |
 | `Ctrl+Y`          | Redo                                        |
