@@ -738,6 +738,7 @@ public:
     double stroke_width = 5.0;
     double eraser_radius = 16.0;
     bool is_visible = false;
+    bool has_focus = false;
 
     // Text typing state
     bool is_typing = false;
@@ -965,7 +966,7 @@ public:
         send_wm_message(a_net_wm_state, 1 /* _NET_WM_STATE_ADD */, (long)a_net_wm_state_above, 0, 1);
     }
 
-    void present_window(Time t) {
+    void present_window(Time t = CurrentTime) {
         if (!is_visible) return;
         XRaiseWindow(dpy, window);
         // Source indication 2 (pager) so the WM honours the request without focus-stealing checks
@@ -1147,8 +1148,16 @@ public:
         if (XFilterEvent(&ev, XNone)) return; // consumed by the input method
 
         switch (ev.type) {
+            case MapNotify:
+                if (ev.xmap.window == window && is_visible && !passthrough_mode) {
+                    pending_reclaim_focus = true;
+                }
+                break;
             case Expose:
                 add_dirty_rect(ev.xexpose.x, ev.xexpose.y, ev.xexpose.width, ev.xexpose.height);
+                if (ev.xexpose.count == 0 && is_visible && !passthrough_mode && !has_focus) {
+                    pending_reclaim_focus = true;
+                }
                 break;
             case ConfigureNotify:
                 if (ev.xconfigure.window == window &&
@@ -1181,11 +1190,15 @@ public:
                 on_key_press(ev.xkey);
                 break;
             case FocusIn:
+                if (ev.xfocus.detail != NotifyPointer) {
+                    has_focus = true;
+                }
                 if (xic) XSetICFocus(xic);
                 break;
             case FocusOut:
                 if (xic) XUnsetICFocus(xic);
                 if (ev.xfocus.detail != NotifyInferior && ev.xfocus.detail != NotifyPointer) {
+                    has_focus = false;
                     on_focus_out();
                 }
                 break;
@@ -1224,7 +1237,10 @@ public:
         if (focus_keepalive_next_us && now >= focus_keepalive_next_us) {
             if (is_visible) {
                 set_keep_above();
-                focus_keepalive_next_us = now + 500000;
+                if (!passthrough_mode && !has_focus) {
+                    present_window(CurrentTime);
+                }
+                focus_keepalive_next_us = now + (has_focus ? 500000 : 100000);
             } else {
                 focus_keepalive_next_us = 0;
             }
@@ -2434,6 +2450,9 @@ public:
     // ── Event Handlers ────────────────────────────────────────────────────
 
     bool on_button_press(double x, double y, Time time) {
+        if (!has_focus && !passthrough_mode) {
+            present_window(time);
+        }
 
         // 1. Toolbar click
         if (in_toolbar_zone(y)) {
@@ -3383,16 +3402,18 @@ public:
     void show_overlay() {
         is_visible = true;
         map_window();
-        present_window(last_event_time);
         current_cursor_name.clear();
         update_cursor(mouse_x, mouse_y);
         invalidate_full();
+        present_dirty();
+        present_window(CurrentTime);
         start_focus_keepalive();
     }
 
     void hide_overlay() {
         if (is_typing) commit_text();
         is_visible = false;
+        has_focus = false;
         passthrough_mode = false;
         submenu_open.clear();
         submenu_items.clear();
@@ -3414,8 +3435,8 @@ public:
     }
 
     void reclaim_focus() {
-        if (is_visible) {
-            present_window(last_event_time);
+        if (is_visible && !passthrough_mode) {
+            present_window(CurrentTime);
         }
     }
 
@@ -3427,6 +3448,7 @@ public:
         update_cursor(mouse_x, mouse_y);
         invalidate_full();
         pending_reclaim_focus = true;
+        start_focus_keepalive();
     }
 
     void reassert_top() {
@@ -3444,7 +3466,7 @@ public:
     }
 
     void start_focus_keepalive() {
-        focus_keepalive_next_us = monotonic_us() + 500000;
+        focus_keepalive_next_us = monotonic_us() + 50000;
     }
 
     void stop_focus_keepalive() {
