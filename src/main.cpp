@@ -184,6 +184,27 @@ static double point_to_segment_dist(double px, double py, double x1, double y1, 
     return std::hypot(px - proj_x, py - proj_y);
 }
 
+static bool segment_intersects_box(double x1, double y1, double x2, double y2, const BBox& box) {
+    if (std::max(x1, x2) < box.x1 || std::min(x1, x2) > box.x2 ||
+        std::max(y1, y2) < box.y1 || std::min(y1, y2) > box.y2) {
+        return false;
+    }
+    double dx = x2 - x1;
+    double dy = y2 - y1;
+    auto cross = [&](double px, double py) {
+        return dx * (py - y1) - dy * (px - x1);
+    };
+    double c1 = cross(box.x1, box.y1);
+    double c2 = cross(box.x2, box.y1);
+    double c3 = cross(box.x2, box.y2);
+    double c4 = cross(box.x1, box.y2);
+    if ((c1 > 0 && c2 > 0 && c3 > 0 && c4 > 0) ||
+        (c1 < 0 && c2 < 0 && c3 < 0 && c4 < 0)) {
+        return false;
+    }
+    return true;
+}
+
 // ─── Resize Handle Identifiers ───────────────────────────────────────────────
 
 enum class HandleId {
@@ -484,6 +505,48 @@ struct DrawItem {
         return false;
     }
 
+    // Hit test for marquee / box selection
+    bool intersects_box(const BBox& box) const {
+        if (!is_selectable()) return false;
+        BBox rb = raw_bounds();
+        double tol = width * 0.5 + 2.0;
+        if (!rb.padded(tol).intersects(box.x1, box.y1, box.width(), box.height())) {
+            return false;
+        }
+        if (kind == StrokeKind::Shape) {
+            if (shape_type == ToolType::Line || shape_type == ToolType::Arrow) {
+                BBox pbox = box.padded(tol);
+                if (segment_intersects_box(x1, y1, x2, y2, pbox)) return true;
+                if (shape_type == ToolType::Arrow) {
+                    double angle = std::atan2(y2 - y1, x2 - x1);
+                    double head_len = std::max(width * 3.5, 20.0);
+                    double spread = M_PI / 6.0;
+                    for (int sign : {-1, 1}) {
+                        double lx = x2 - head_len * std::cos(angle + sign * spread);
+                        double ly = y2 - head_len * std::sin(angle + sign * spread);
+                        if (segment_intersects_box(x2, y2, lx, ly, pbox)) return true;
+                    }
+                }
+                return false;
+            }
+            return true;
+        } else if (kind == StrokeKind::Text) {
+            return true;
+        } else if (kind == StrokeKind::Freehand) {
+            BBox pbox = box.padded(tol);
+            if (points.size() == 1) {
+                return pbox.contains(points[0].x, points[0].y);
+            }
+            for (size_t i = 0; i + 1 < points.size(); ++i) {
+                if (segment_intersects_box(points[i].x, points[i].y, points[i + 1].x, points[i + 1].y, pbox)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
     // Return interactive resize handles for this item
     std::vector<HandlePoint> get_handles() const {
         std::vector<HandlePoint> handles;
@@ -608,7 +671,7 @@ struct DrawItem {
     }
 
     // Draw selection box and interactive handles
-    void draw_selection_overlay(cairo_t* cr) const {
+    void draw_selection_overlay(cairo_t* cr, bool show_handles = true) const {
         cairo_save(cr);
         cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
@@ -634,22 +697,24 @@ struct DrawItem {
         }
 
         // Draw handles
-        auto handles = get_handles();
-        for (const auto& h : handles) {
-            // Outer shadow
-            cairo_arc(cr, h.x, h.y + 1.0, HANDLE_RADIUS + 1.0, 0.0, 2.0 * M_PI);
-            cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.35);
-            cairo_fill(cr);
+        if (show_handles) {
+            auto handles = get_handles();
+            for (const auto& h : handles) {
+                // Outer shadow
+                cairo_arc(cr, h.x, h.y + 1.0, HANDLE_RADIUS + 1.0, 0.0, 2.0 * M_PI);
+                cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.35);
+                cairo_fill(cr);
 
-            // White fill
-            cairo_arc(cr, h.x, h.y, HANDLE_RADIUS, 0.0, 2.0 * M_PI);
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
-            cairo_fill_preserve(cr);
+                // White fill
+                cairo_arc(cr, h.x, h.y, HANDLE_RADIUS, 0.0, 2.0 * M_PI);
+                cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+                cairo_fill_preserve(cr);
 
-            // Accent border
-            cairo_set_source_rgba(cr, 0.0, 0.48, 1.0, 1.0);
-            cairo_set_line_width(cr, 2.0);
-            cairo_stroke(cr);
+                // Accent border
+                cairo_set_source_rgba(cr, 0.0, 0.48, 1.0, 1.0);
+                cairo_set_line_width(cr, 2.0);
+                cairo_stroke(cr);
+            }
         }
 
         cairo_restore(cr);
@@ -718,13 +783,22 @@ public:
     std::vector<std::vector<DrawItem>> redo_stack;
 
     // Selection & Move/Resize state
-    int selected_index = -1;
-    bool is_manipulating = false; // moving or resizing selected item
+    int selected_index = -1; // >= 0 when exactly one item is selected
+    std::vector<int> selected_indices;
+    bool is_manipulating = false; // moving or resizing selected item(s)
     HandleId active_handle = HandleId::None;
     double drag_start_x = 0.0;
     double drag_start_y = 0.0;
     DrawItem drag_orig_item;
+    std::vector<std::pair<int, DrawItem>> drag_orig_items;
     bool drag_modified = false;
+    int pending_single_select_index = -1;
+
+    // Marquee (rubber-band) multi-selection state
+    bool is_box_selecting = false;
+    Point box_select_start = {0, 0};
+    Point box_select_end = {0, 0};
+    std::vector<int> box_select_initial;
 
     // Active drawing state
     bool is_drawing = false;
@@ -769,7 +843,8 @@ public:
 
     // Offscreen Cairo surfaces for blazing fast rendering
     cairo_surface_t* canvas_surface = nullptr;
-    int canvas_skip_index = -1; // When actively moving/resizing an item, exclude it from static canvas_surface
+    int canvas_skip_index = -1; // When actively editing an item, exclude it from static canvas_surface
+    bool canvas_skip_selection = false; // When actively moving/resizing selected item(s), exclude them from static canvas_surface
     cairo_surface_t* toolbar_cache_surface = nullptr;
     bool toolbar_cache_dirty = true;
     int cached_toolbar_width = -1;
@@ -1172,7 +1247,7 @@ public:
             case ButtonPress:
                 last_event_time = ev.xbutton.time;
                 if (ev.xbutton.button == Button1) {
-                    on_button_press(ev.xbutton.x, ev.xbutton.y, ev.xbutton.time);
+                    on_button_press(ev.xbutton.x, ev.xbutton.y, ev.xbutton.time, ev.xbutton.state);
                 }
                 break;
             case ButtonRelease:
@@ -1367,6 +1442,7 @@ public:
 
         for (size_t i = 0; i < strokes.size(); ++i) {
             if ((int)i == skip_idx) continue;
+            if (canvas_skip_selection && is_selected((int)i)) continue;
             strokes[i].draw(cr);
         }
         cairo_destroy(cr);
@@ -1418,10 +1494,16 @@ public:
         cairo_set_source_surface(cr, canvas_surface, 0.0, 0.0);
         cairo_paint(cr);
 
-        // 4. If we are actively moving/resizing a selected item (which was excluded from canvas_surface),
-        //    draw it dynamically now!
-        if (canvas_skip_index >= 0 && canvas_skip_index < (int)strokes.size() &&
-            !(is_typing && canvas_skip_index == editing_index)) {
+        // 4. If we are actively moving/resizing selected item(s) (which were excluded from canvas_surface),
+        //    draw them dynamically now!
+        if (canvas_skip_selection) {
+            for (int idx : selected_indices) {
+                if (idx >= 0 && idx < (int)strokes.size() && !(is_typing && idx == editing_index)) {
+                    strokes[idx].draw(cr);
+                }
+            }
+        } else if (canvas_skip_index >= 0 && canvas_skip_index < (int)strokes.size() &&
+                   !(is_typing && canvas_skip_index == editing_index)) {
             strokes[canvas_skip_index].draw(cr);
             // If any erasers exist above this stroke in z-order, apply them on top or keep z-order accurate
         }
@@ -1436,11 +1518,58 @@ public:
             draw_typing_text(cr);
         }
 
-        // 7. Paint selection bounding box & resize handles for selected shape
-        if (selected_index >= 0 && selected_index < (int)strokes.size() && !passthrough_mode) {
-            const auto& sel = strokes[selected_index];
-            if (sel.visual_bounds(true).intersects(clip_rect.x, clip_rect.y, clip_rect.width, clip_rect.height)) {
-                sel.draw_selection_overlay(cr);
+        // 7. Paint selection bounding box & resize handles for selected shape(s)
+        if (!selected_indices.empty() && !passthrough_mode) {
+            if (selected_indices.size() == 1) {
+                int idx = selected_indices[0];
+                if (idx >= 0 && idx < (int)strokes.size()) {
+                    const auto& sel = strokes[idx];
+                    if (sel.visual_bounds(true).intersects(clip_rect.x, clip_rect.y, clip_rect.width, clip_rect.height)) {
+                        sel.draw_selection_overlay(cr, true);
+                    }
+                }
+            } else {
+                for (int idx : selected_indices) {
+                    if (idx >= 0 && idx < (int)strokes.size()) {
+                        const auto& sel = strokes[idx];
+                        if (sel.visual_bounds(false).intersects(clip_rect.x, clip_rect.y, clip_rect.width, clip_rect.height)) {
+                            sel.draw_selection_overlay(cr, false);
+                        }
+                    }
+                }
+                BBox gb = selection_raw_bounds().padded(6.0);
+                if (gb.padded(4.0).intersects(clip_rect.x, clip_rect.y, clip_rect.width, clip_rect.height)) {
+                    cairo_save(cr);
+                    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+                    double dashes[] = {6.0, 4.0};
+                    cairo_set_dash(cr, dashes, 2, 0.0);
+                    cairo_set_line_width(cr, 1.5);
+                    cairo_set_source_rgba(cr, 0.25, 0.62, 1.0, 0.95);
+                    cairo_rectangle(cr, gb.x1, gb.y1, gb.width(), gb.height());
+                    cairo_stroke(cr);
+                    cairo_restore(cr);
+                }
+            }
+        }
+
+        // 7b. Paint marquee selection box while dragging
+        if (is_box_selecting && !passthrough_mode) {
+            double bx = std::min(box_select_start.x, box_select_end.x);
+            double by = std::min(box_select_start.y, box_select_end.y);
+            double bw = std::abs(box_select_end.x - box_select_start.x);
+            double bh = std::abs(box_select_end.y - box_select_start.y);
+            if (bw > 1.0 || bh > 1.0) {
+                cairo_save(cr);
+                cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+                cairo_set_source_rgba(cr, 0.25, 0.62, 1.0, 0.12);
+                cairo_rectangle(cr, bx, by, bw, bh);
+                cairo_fill_preserve(cr);
+                double dashes[] = {5.0, 4.0};
+                cairo_set_dash(cr, dashes, 2, 0.0);
+                cairo_set_line_width(cr, 1.5);
+                cairo_set_source_rgba(cr, 0.25, 0.62, 1.0, 0.85);
+                cairo_stroke(cr);
+                cairo_restore(cr);
             }
         }
 
@@ -2303,18 +2432,114 @@ public:
         return y > TOOLBAR_HEIGHT && y < TOOLBAR_HEIGHT + 130.0;
     }
 
-    int find_topmost_selectable_at(double x, double y) const {
+    // ── Selection Helpers ─────────────────────────────────────────────────
+
+    void sync_selected_index() {
+        std::sort(selected_indices.begin(), selected_indices.end());
+        selected_indices.erase(std::unique(selected_indices.begin(), selected_indices.end()), selected_indices.end());
+        selected_indices.erase(
+            std::remove_if(selected_indices.begin(), selected_indices.end(),
+                           [&](int idx) { return idx < 0 || idx >= (int)strokes.size() || !strokes[idx].is_selectable(); }),
+            selected_indices.end());
+        selected_index = (selected_indices.size() == 1) ? selected_indices[0] : -1;
+    }
+
+    bool has_selection() const {
+        return !selected_indices.empty();
+    }
+
+    bool is_selected(int idx) const {
+        return std::binary_search(selected_indices.begin(), selected_indices.end(), idx);
+    }
+
+    BBox selection_raw_bounds() const {
+        BBox res = {0, 0, -1, -1};
+        for (int idx : selected_indices) {
+            if (idx >= 0 && idx < (int)strokes.size()) {
+                res = res.united(strokes[idx].raw_bounds());
+            }
+        }
+        return res;
+    }
+
+    BBox selection_visual_bounds() const {
+        BBox res = {0, 0, -1, -1};
+        for (int idx : selected_indices) {
+            if (idx >= 0 && idx < (int)strokes.size()) {
+                res = res.united(strokes[idx].visual_bounds(true));
+            }
+        }
+        if (res.valid()) return res.padded(6.0);
+        return res;
+    }
+
+    void invalidate_selection() {
+        if (has_selection()) {
+            invalidate_bbox(selection_visual_bounds());
+        }
+    }
+
+    void clear_selection() {
+        if (!selected_indices.empty()) {
+            BBox b = selection_visual_bounds();
+            selected_indices.clear();
+            selected_index = -1;
+            invalidate_bbox(b);
+        } else {
+            selected_index = -1;
+        }
+    }
+
+    void set_single_selection(int idx) {
+        BBox old_b = selection_visual_bounds();
+        bool had_sel = has_selection();
+        selected_indices.clear();
+        if (idx >= 0 && idx < (int)strokes.size() && strokes[idx].is_selectable()) {
+            selected_indices.push_back(idx);
+        }
+        sync_selected_index();
+        if (had_sel) invalidate_bbox(old_b);
+        if (has_selection()) invalidate_bbox(selection_visual_bounds());
+    }
+
+    void toggle_selection_item(int idx) {
+        if (idx < 0 || idx >= (int)strokes.size() || !strokes[idx].is_selectable()) return;
+        BBox old_b = selection_visual_bounds();
+        bool had_sel = has_selection();
+        auto it = std::find(selected_indices.begin(), selected_indices.end(), idx);
+        if (it != selected_indices.end()) {
+            selected_indices.erase(it);
+        } else {
+            selected_indices.push_back(idx);
+        }
+        sync_selected_index();
+        if (had_sel) invalidate_bbox(old_b);
+        if (has_selection()) invalidate_bbox(selection_visual_bounds());
+        invalidate_bbox(strokes[idx].visual_bounds(true));
+    }
+
+    int find_topmost_selectable_at(double x, double y, bool force_interior_bbox = false) const {
         for (int i = (int)strokes.size() - 1; i >= 0; --i) {
             if (strokes[i].hit_test(x, y, false)) {
                 return i;
             }
         }
         // Second pass allowing bounding box interior hit if in Select tool
-        if (current_tool == ToolType::Select) {
+        if (current_tool == ToolType::Select || force_interior_bbox) {
             for (int i = (int)strokes.size() - 1; i >= 0; --i) {
                 if (strokes[i].hit_test(x, y, true)) {
                     return i;
                 }
+            }
+        }
+        return -1;
+    }
+
+    int hit_selected_at(double x, double y) const {
+        for (int i = (int)selected_indices.size() - 1; i >= 0; --i) {
+            int idx = selected_indices[i];
+            if (idx >= 0 && idx < (int)strokes.size() && strokes[idx].hit_test(x, y, true)) {
+                return idx;
             }
         }
         return -1;
@@ -2407,9 +2632,7 @@ public:
         if (idx < 0 || idx >= (int)strokes.size() || strokes[idx].kind != StrokeKind::Text) return;
         const DrawItem& item = strokes[idx];
         BBox old_b = item.visual_bounds(true);
-        if (selected_index >= 0 && selected_index < (int)strokes.size()) {
-            invalidate_bbox(strokes[selected_index].visual_bounds(true));
-        }
+        clear_selection();
 
         is_typing = true;
         is_typing_drag = false;
@@ -2426,8 +2649,9 @@ public:
         text_color = item.color;
         text_size = item.font_size;
         text_bg_color = item.bg_color.empty() ? "transparent" : item.bg_color;
-        selected_index = -1;
         is_manipulating = false;
+        is_box_selecting = false;
+        canvas_skip_selection = false;
         active_handle = HandleId::None;
         toolbar_cache_dirty = true;
 
@@ -2449,7 +2673,7 @@ public:
 
     // ── Event Handlers ────────────────────────────────────────────────────
 
-    bool on_button_press(double x, double y, Time time) {
+    bool on_button_press(double x, double y, Time time, unsigned int state = 0) {
         if (!has_focus && !passthrough_mode) {
             present_window(time);
         }
@@ -2513,54 +2737,76 @@ public:
             if (current_tool != ToolType::Text) return true;
         }
 
-        // 6. Check if user clicked a resize handle or body of the currently selected shape!
-        //    This works both in Select tool AND right after drawing a shape!
-        if (selected_index >= 0 && selected_index < (int)strokes.size()) {
-            const auto& sel = strokes[selected_index];
-            HandleId hid = sel.hit_handle(x, y);
-            if (hid != HandleId::None) {
-                start_manipulation(selected_index, hid, x, y);
+        bool multi_mod = (state & (ShiftMask | ControlMask)) != 0;
+        pending_single_select_index = -1;
+
+        // 6. When Shift/Ctrl is held, toggle items in the multi-selection (or start additive marquee in Select tool)
+        if (multi_mod && (current_tool == ToolType::Select || has_selection())) {
+            int hit_idx = find_topmost_selectable_at(x, y, true);
+            if (hit_idx >= 0) {
+                toggle_selection_item(hit_idx);
+                if (is_selected(hit_idx)) {
+                    start_manipulation(HandleId::Body, x, y);
+                }
+                update_cursor(x, y);
                 return true;
             }
-            if (sel.hit_test(x, y, true)) {
-                if (current_tool == ToolType::Text && sel.kind == StrokeKind::Text) {
-                    begin_edit_text(selected_index, x);
-                    return true;
-                }
-                start_manipulation(selected_index, HandleId::Body, x, y);
+            if (current_tool == ToolType::Select) {
+                start_box_selection(x, y, true);
                 return true;
             }
         }
 
-        // 7. If in Select tool, check if user clicked any drawn shape to select & move it
+        // 7. Check if user clicked a resize handle of a single selected shape
+        if (!multi_mod && selected_index >= 0 && selected_index < (int)strokes.size()) {
+            HandleId hid = strokes[selected_index].hit_handle(x, y);
+            if (hid != HandleId::None) {
+                start_manipulation(hid, x, y);
+                return true;
+            }
+        }
+
+        // 8. If in Select tool, handle single/multi-item selection, group move, or marquee box drag
         if (current_tool == ToolType::Select) {
-            int hit_idx = find_topmost_selectable_at(x, y);
-            if (hit_idx != selected_index) {
-                int old_sel = selected_index;
-                selected_index = hit_idx;
-                if (old_sel >= 0 && old_sel < (int)strokes.size()) {
-                    invalidate_bbox(strokes[old_sel].visual_bounds(true));
+            int hit_idx = find_topmost_selectable_at(x, y, true);
+            if (hit_idx >= 0) {
+                if (is_selected(hit_idx)) {
+                    if (selected_indices.size() > 1) {
+                        pending_single_select_index = hit_idx;
+                    }
+                    start_manipulation(HandleId::Body, x, y);
+                } else {
+                    set_single_selection(hit_idx);
+                    HandleId hid = strokes[hit_idx].hit_handle(x, y);
+                    start_manipulation((hid != HandleId::None) ? hid : HandleId::Body, x, y);
                 }
-                if (selected_index >= 0) {
-                    invalidate_bbox(strokes[selected_index].visual_bounds(true));
-                }
+                return true;
             }
-            if (selected_index >= 0) {
-                HandleId hid = strokes[selected_index].hit_handle(x, y);
-                start_manipulation(selected_index, (hid != HandleId::None) ? hid : HandleId::Body, x, y);
+            if (selected_indices.size() > 1 && selection_raw_bounds().padded(4.0).contains(x, y)) {
+                start_manipulation(HandleId::Body, x, y);
+                return true;
             }
-            update_cursor(x, y);
+            start_box_selection(x, y, false);
             return true;
         }
 
-        // Deselect any previously selected shape when starting a new stroke
-        if (selected_index >= 0) {
-            BBox old_b = strokes[selected_index].visual_bounds(true);
-            selected_index = -1;
-            invalidate_bbox(old_b);
+        // 9. When not in Select tool, clicking an already-selected shape(s) still moves (or edits) it
+        if (has_selection()) {
+            int sel_hit = hit_selected_at(x, y);
+            if (sel_hit >= 0 || (selected_indices.size() > 1 && selection_raw_bounds().padded(4.0).contains(x, y))) {
+                if (selected_index >= 0 && current_tool == ToolType::Text &&
+                    strokes[selected_index].kind == StrokeKind::Text) {
+                    begin_edit_text(selected_index, x);
+                    return true;
+                }
+                start_manipulation(HandleId::Body, x, y);
+                return true;
+            }
+            // Deselect any previously selected shape(s) when starting a new stroke
+            clear_selection();
         }
 
-        // 8. Text tool: click an existing text to edit it, or empty space to start new text
+        // 10. Text tool: click an existing text to edit it, or empty space to start new text
         if (current_tool == ToolType::Text) {
             if (begin_edit_text_at(x, y)) return true;
             is_typing = true;
@@ -2575,7 +2821,7 @@ public:
             return true;
         }
 
-        // 9. Start drawing Pen, Eraser, or Shape
+        // 11. Start drawing Pen, Eraser, or Shape
         is_drawing = true;
         if (current_tool == ToolType::Pen || current_tool == ToolType::Eraser) {
             current_points.clear();
@@ -2587,17 +2833,40 @@ public:
         return true;
     }
 
-    void start_manipulation(int idx, HandleId hid, double x, double y) {
-        selected_index = idx;
+    void start_box_selection(double x, double y, bool additive) {
+        is_box_selecting = true;
+        box_select_start = {x, y};
+        box_select_end = {x, y};
+        if (additive) {
+            box_select_initial = selected_indices;
+        } else {
+            clear_selection();
+            box_select_initial.clear();
+        }
+        update_cursor(x, y);
+    }
+
+    void start_manipulation(HandleId hid, double x, double y) {
+        if (selected_indices.empty()) return;
         is_manipulating = true;
         active_handle = hid;
         drag_start_x = x;
         drag_start_y = y;
-        drag_orig_item = strokes[idx];
+        drag_orig_items.clear();
+        drag_orig_items.reserve(selected_indices.size());
+        for (int idx : selected_indices) {
+            if (idx >= 0 && idx < (int)strokes.size()) {
+                drag_orig_items.push_back({idx, strokes[idx]});
+            }
+        }
+        if (selected_index >= 0 && selected_index < (int)strokes.size()) {
+            drag_orig_item = strokes[selected_index];
+        }
         drag_modified = false;
-        // Rebuild static canvas once without the actively manipulated item so motion frames are ultra-fast
-        rebuild_canvas(idx);
-        invalidate_bbox(strokes[idx].visual_bounds(true));
+        // Rebuild static canvas once without the actively manipulated item(s) so motion frames are ultra-fast
+        canvas_skip_selection = true;
+        rebuild_canvas(-1);
+        invalidate_selection();
         update_cursor(x, y);
     }
 
@@ -2606,21 +2875,47 @@ public:
             is_typing_drag = false;
         }
 
+        if (is_box_selecting) {
+            BBox cur_box = {std::min(box_select_start.x, box_select_end.x),
+                            std::min(box_select_start.y, box_select_end.y),
+                            std::max(box_select_start.x, box_select_end.x),
+                            std::max(box_select_start.y, box_select_end.y)};
+            is_box_selecting = false;
+            box_select_initial.clear();
+            invalidate_bbox(cur_box.padded(8.0));
+            invalidate_selection();
+            update_cursor(ev_x, ev_y);
+            return true;
+        }
+
         if (is_manipulating) {
             HandleId released_handle = active_handle;
+            int clicked_single = pending_single_select_index;
+            pending_single_select_index = -1;
             is_manipulating = false;
             active_handle = HandleId::None;
-            if (drag_modified && selected_index >= 0 && selected_index < (int)strokes.size()) {
+            canvas_skip_selection = false;
+            if (drag_modified && !drag_orig_items.empty()) {
                 // Push the pre-drag state to undo stack
-                DrawItem final_item = strokes[selected_index];
-                strokes[selected_index] = drag_orig_item;
+                std::vector<std::pair<int, DrawItem>> final_items;
+                final_items.reserve(drag_orig_items.size());
+                for (const auto& kv : drag_orig_items) {
+                    int idx = kv.first;
+                    if (idx >= 0 && idx < (int)strokes.size()) {
+                        final_items.push_back({idx, strokes[idx]});
+                        strokes[idx] = kv.second;
+                    }
+                }
                 push_undo_snapshot();
-                strokes[selected_index] = final_item;
+                for (const auto& kv : final_items) {
+                    strokes[kv.first] = kv.second;
+                }
+            } else if (!drag_modified && clicked_single >= 0) {
+                set_single_selection(clicked_single);
             }
+            drag_orig_items.clear();
             rebuild_canvas(-1);
-            if (selected_index >= 0 && selected_index < (int)strokes.size()) {
-                invalidate_bbox(strokes[selected_index].visual_bounds(true));
-            }
+            invalidate_selection();
             // Text tool: a plain click (no drag) on a selected text's body edits it
             if (!drag_modified && released_handle == HandleId::Body && current_tool == ToolType::Text &&
                 selected_index >= 0 && selected_index < (int)strokes.size() &&
@@ -2669,8 +2964,7 @@ public:
                 // Click without drag on a shape tool: check if user clicked an existing shape to select it!
                 int hit_idx = find_topmost_selectable_at(ev_x, ev_y);
                 if (hit_idx >= 0) {
-                    selected_index = hit_idx;
-                    invalidate_bbox(strokes[selected_index].visual_bounds(true));
+                    set_single_selection(hit_idx);
                 }
             }
         }
@@ -2689,9 +2983,9 @@ public:
             cairo_destroy(cr);
         }
         if (select_after && item.is_selectable()) {
-            selected_index = (int)strokes.size() - 1;
+            set_single_selection((int)strokes.size() - 1);
         } else {
-            selected_index = -1;
+            clear_selection();
         }
         invalidate_bbox(item.visual_bounds(true));
     }
@@ -2718,7 +3012,7 @@ public:
                 if (!has_non_space) {
                     push_undo_snapshot();
                     strokes.erase(strokes.begin() + idx);
-                    selected_index = -1;
+                    clear_selection();
                 } else {
                     bool changed = item.text != typing_text || item.color != text_color ||
                                    item.font_size != text_size || item.bg_color != text_bg_color;
@@ -2731,7 +3025,7 @@ public:
                         item.text_metrics_valid = false;
                         item.update_text_metrics();
                     }
-                    selected_index = idx;
+                    set_single_selection(idx);
                 }
                 invalidate_bbox(old_b);
                 typing_text.clear();
@@ -2780,20 +3074,58 @@ public:
             return true;
         }
 
-        // 1. Active Move / Resize of a selected shape
-        if (is_manipulating && selected_index >= 0 && selected_index < (int)strokes.size()) {
-            BBox before_box = strokes[selected_index].visual_bounds(true);
+        // 0b. Marquee (rubber-band) box selection
+        if (is_box_selecting) {
+            BBox prev_box = {std::min(box_select_start.x, box_select_end.x),
+                             std::min(box_select_start.y, box_select_end.y),
+                             std::max(box_select_start.x, box_select_end.x),
+                             std::max(box_select_start.y, box_select_end.y)};
+            BBox prev_sel = selection_visual_bounds();
+            bool had_sel = has_selection();
+
+            box_select_end = {x, y};
+            BBox cur_box = {std::min(box_select_start.x, box_select_end.x),
+                            std::min(box_select_start.y, box_select_end.y),
+                            std::max(box_select_start.x, box_select_end.x),
+                            std::max(box_select_start.y, box_select_end.y)};
+
+            selected_indices = box_select_initial;
+            if (cur_box.width() >= 2.0 || cur_box.height() >= 2.0) {
+                for (int i = 0; i < (int)strokes.size(); ++i) {
+                    if (strokes[i].intersects_box(cur_box)) {
+                        selected_indices.push_back(i);
+                    }
+                }
+            }
+            sync_selected_index();
+
+            BBox dirty = prev_box.united(cur_box).padded(8.0);
+            if (had_sel) dirty = dirty.united(prev_sel);
+            if (has_selection()) dirty = dirty.united(selection_visual_bounds());
+            invalidate_bbox(dirty);
+            return true;
+        }
+
+        // 1. Active Move / Resize of selected shape(s)
+        if (is_manipulating && !selected_indices.empty()) {
+            BBox before_box = selection_visual_bounds();
             double dx = x - drag_start_x;
             double dy = y - drag_start_y;
             if (std::hypot(dx, dy) > 0.5) {
                 drag_modified = true;
+                pending_single_select_index = -1;
             }
             if (active_handle == HandleId::Body) {
-                strokes[selected_index].apply_move_from(drag_orig_item, dx, dy);
-            } else {
+                for (const auto& kv : drag_orig_items) {
+                    int idx = kv.first;
+                    if (idx >= 0 && idx < (int)strokes.size()) {
+                        strokes[idx].apply_move_from(kv.second, dx, dy);
+                    }
+                }
+            } else if (selected_index >= 0 && selected_index < (int)strokes.size()) {
                 strokes[selected_index].apply_resize_from(drag_orig_item, active_handle, dx, dy);
             }
-            BBox after_box = strokes[selected_index].visual_bounds(true);
+            BBox after_box = selection_visual_bounds();
             invalidate_bbox(before_box.united(after_box));
             return true;
         }
@@ -2924,6 +3256,10 @@ public:
             set_cursor_by_name(cursor_for_handle(active_handle));
             return;
         }
+        if (is_box_selecting) {
+            set_cursor_by_name("crosshair");
+            return;
+        }
         if (is_typing && typing_visual_bounds().padded(8.0).contains(x, y)) {
             set_cursor_by_name("text");
             return;
@@ -2935,6 +3271,11 @@ public:
                 return;
             }
             if (strokes[selected_index].hit_test(x, y, true)) {
+                set_cursor_by_name("move");
+                return;
+            }
+        } else if (selected_indices.size() > 1) {
+            if (hit_selected_at(x, y) >= 0 || selection_raw_bounds().padded(4.0).contains(x, y)) {
                 set_cursor_by_name("move");
                 return;
             }
@@ -3157,16 +3498,33 @@ public:
                 submenu_open.clear();
                 submenu_items.clear();
                 invalidate_full();
-            } else if (selected_index >= 0) {
-                BBox b = strokes[selected_index].visual_bounds(true);
-                selected_index = -1;
-                invalidate_bbox(b);
+            } else if (has_selection()) {
+                clear_selection();
             }
-        } else if ((kname == "Delete" || kname == "BackSpace") && selected_index >= 0 && selected_index < (int)strokes.size()) {
+        } else if ((kname == "Delete" || kname == "BackSpace") && has_selection()) {
             push_undo_snapshot();
-            strokes.erase(strokes.begin() + selected_index);
+            for (int i = (int)selected_indices.size() - 1; i >= 0; --i) {
+                int idx = selected_indices[i];
+                if (idx >= 0 && idx < (int)strokes.size()) {
+                    strokes.erase(strokes.begin() + idx);
+                }
+            }
+            selected_indices.clear();
             selected_index = -1;
             rebuild_canvas(-1);
+            invalidate_full();
+        } else if (ctrl && (kname == "a" || kname == "A")) {
+            selected_indices.clear();
+            for (int i = 0; i < (int)strokes.size(); ++i) {
+                if (strokes[i].is_selectable()) {
+                    selected_indices.push_back(i);
+                }
+            }
+            sync_selected_index();
+            if (has_selection()) {
+                current_tool = ToolType::Select;
+                toolbar_cache_dirty = true;
+            }
             invalidate_full();
         } else if (ctrl && (kname == "z" || kname == "Z")) {
             undo();
@@ -3265,48 +3623,58 @@ public:
         toolbar_cache_dirty = true;
         if (item.type == "color") {
             current_color = item.str_val;
-            if (selected_index >= 0 && selected_index < (int)strokes.size() &&
-                strokes[selected_index].kind != StrokeKind::Text) {
-                push_undo_snapshot();
-                strokes[selected_index].color = current_color;
-                rebuild_canvas(-1);
+            bool any = false;
+            for (int idx : selected_indices) {
+                if (idx >= 0 && idx < (int)strokes.size() && strokes[idx].kind != StrokeKind::Text) {
+                    if (!any) { push_undo_snapshot(); any = true; }
+                    strokes[idx].color = current_color;
+                }
             }
+            if (any) rebuild_canvas(-1);
         } else if (item.type == "pen_stroke") {
             stroke_width = item.int_val;
-            if (selected_index >= 0 && selected_index < (int)strokes.size() &&
-                strokes[selected_index].kind != StrokeKind::Text) {
-                push_undo_snapshot();
-                strokes[selected_index].width = stroke_width;
-                rebuild_canvas(-1);
+            bool any = false;
+            for (int idx : selected_indices) {
+                if (idx >= 0 && idx < (int)strokes.size() && strokes[idx].kind != StrokeKind::Text) {
+                    if (!any) { push_undo_snapshot(); any = true; }
+                    strokes[idx].width = stroke_width;
+                }
             }
+            if (any) rebuild_canvas(-1);
         } else if (item.type == "eraser_radius") {
             eraser_radius = item.int_val;
         } else if (item.type == "text_color") {
             text_color = item.str_val;
-            if (selected_index >= 0 && selected_index < (int)strokes.size() &&
-                strokes[selected_index].kind == StrokeKind::Text) {
-                push_undo_snapshot();
-                strokes[selected_index].color = text_color;
-                rebuild_canvas(-1);
+            bool any = false;
+            for (int idx : selected_indices) {
+                if (idx >= 0 && idx < (int)strokes.size() && strokes[idx].kind == StrokeKind::Text) {
+                    if (!any) { push_undo_snapshot(); any = true; }
+                    strokes[idx].color = text_color;
+                }
             }
+            if (any) rebuild_canvas(-1);
         } else if (item.type == "text_bg_color") {
             text_bg_color = item.str_val;
-            if (selected_index >= 0 && selected_index < (int)strokes.size() &&
-                strokes[selected_index].kind == StrokeKind::Text) {
-                push_undo_snapshot();
-                strokes[selected_index].bg_color = text_bg_color;
-                strokes[selected_index].text_metrics_valid = false;
-                rebuild_canvas(-1);
+            bool any = false;
+            for (int idx : selected_indices) {
+                if (idx >= 0 && idx < (int)strokes.size() && strokes[idx].kind == StrokeKind::Text) {
+                    if (!any) { push_undo_snapshot(); any = true; }
+                    strokes[idx].bg_color = text_bg_color;
+                    strokes[idx].text_metrics_valid = false;
+                }
             }
+            if (any) rebuild_canvas(-1);
         } else if (item.type == "text_size") {
             text_size = item.int_val;
-            if (selected_index >= 0 && selected_index < (int)strokes.size() &&
-                strokes[selected_index].kind == StrokeKind::Text) {
-                push_undo_snapshot();
-                strokes[selected_index].font_size = text_size;
-                strokes[selected_index].text_metrics_valid = false;
-                rebuild_canvas(-1);
+            bool any = false;
+            for (int idx : selected_indices) {
+                if (idx >= 0 && idx < (int)strokes.size() && strokes[idx].kind == StrokeKind::Text) {
+                    if (!any) { push_undo_snapshot(); any = true; }
+                    strokes[idx].font_size = text_size;
+                    strokes[idx].text_metrics_valid = false;
+                }
             }
+            if (any) rebuild_canvas(-1);
         }
         invalidate_full();
     }
@@ -3318,7 +3686,7 @@ public:
         submenu_items.clear();
         toolbar_cache_dirty = true;
         if (t == ToolType::Eraser || t == ToolType::Pen) {
-            selected_index = -1;
+            clear_selection();
         }
         if (passthrough_mode) {
             exit_passthrough();
@@ -3332,7 +3700,11 @@ public:
             redo_stack.push_back(strokes);
             strokes = undo_stack.back();
             undo_stack.pop_back();
+            selected_indices.clear();
             selected_index = -1;
+            is_manipulating = false;
+            is_box_selecting = false;
+            canvas_skip_selection = false;
             rebuild_canvas(-1);
             invalidate_full();
         }
@@ -3343,7 +3715,11 @@ public:
             undo_stack.push_back(strokes);
             strokes = redo_stack.back();
             redo_stack.pop_back();
+            selected_indices.clear();
             selected_index = -1;
+            is_manipulating = false;
+            is_box_selecting = false;
+            canvas_skip_selection = false;
             rebuild_canvas(-1);
             invalidate_full();
         }
@@ -3353,7 +3729,11 @@ public:
         if (!strokes.empty()) {
             push_undo_snapshot();
             strokes.clear();
+            selected_indices.clear();
             selected_index = -1;
+            is_manipulating = false;
+            is_box_selecting = false;
+            canvas_skip_selection = false;
             rebuild_canvas(-1);
             invalidate_full();
         }
@@ -3426,7 +3806,10 @@ public:
     void enter_passthrough() {
         if (is_typing) commit_text();
         passthrough_mode = true;
-        selected_index = -1;
+        clear_selection();
+        is_manipulating = false;
+        is_box_selecting = false;
+        canvas_skip_selection = false;
         submenu_open.clear();
         submenu_items.clear();
         toolbar_cache_dirty = true;
