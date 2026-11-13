@@ -1,17 +1,26 @@
 #include "draw_item.hpp"
+#include "latex_math.hpp"
 
 void DrawItem::update_text_metrics() const {
     if (kind != StrokeKind::Text) return;
     cairo_surface_t* tmp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     cairo_t* cr = cairo_create(tmp);
-    cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, font_size);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, text.c_str(), &ext);
-    cached_text_w = std::max(ext.width, 10.0);
-    cached_text_h = std::max(ext.height, font_size * 0.75);
-    cached_x_bearing = ext.x_bearing;
-    cached_y_bearing = (ext.height > 0) ? ext.y_bearing : -font_size * 0.75;
+    if (contains_latex_math(text)) {
+        MathMetrics m = measure_latex_text(cr, text, font_size);
+        cached_text_w = m.width;
+        cached_text_h = m.height;
+        cached_x_bearing = m.x_bearing;
+        cached_y_bearing = m.y_bearing;
+    } else {
+        cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, font_size);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, text.c_str(), &ext);
+        cached_text_w = std::max(ext.width, 10.0);
+        cached_text_h = std::max(ext.height, font_size * 0.75);
+        cached_x_bearing = ext.x_bearing;
+        cached_y_bearing = (ext.height > 0) ? ext.y_bearing : -font_size * 0.75;
+    }
     text_metrics_valid = true;
     cairo_destroy(cr);
     cairo_surface_destroy(tmp);
@@ -135,33 +144,58 @@ void DrawItem::draw(cairo_t* cr) const {
         }
     } else if (kind == StrokeKind::Text) {
         cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-        cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-        cairo_set_font_size(cr, font_size);
+        if (contains_latex_math(text)) {
+            MathMetrics m = measure_latex_text(cr, text, font_size);
+            cached_text_w = m.width;
+            cached_text_h = m.height;
+            cached_x_bearing = m.x_bearing;
+            cached_y_bearing = m.y_bearing;
+            text_metrics_valid = true;
 
-        cairo_text_extents_t ext;
-        cairo_text_extents(cr, text.c_str(), &ext);
-        cached_text_w = std::max(ext.width, 10.0);
-        cached_text_h = std::max(ext.height, font_size * 0.75);
-        cached_x_bearing = ext.x_bearing;
-        cached_y_bearing = (ext.height > 0) ? ext.y_bearing : -font_size * 0.75;
-        text_metrics_valid = true;
+            if (!bg_color.empty() && bg_color != "transparent") {
+                RGBA bg = hex_to_rgba(bg_color);
+                cairo_set_source_rgba(cr, bg.r, bg.g, bg.b, bg.a);
+                double pad = 8.0;
+                cairo_rectangle(cr,
+                                text_x + m.x_bearing - pad,
+                                text_y + m.y_bearing - pad,
+                                m.width + pad * 2.0,
+                                m.height + pad * 2.0);
+                cairo_fill(cr);
+            }
 
-        if (!bg_color.empty() && bg_color != "transparent") {
-            RGBA bg = hex_to_rgba(bg_color);
-            cairo_set_source_rgba(cr, bg.r, bg.g, bg.b, bg.a);
-            double pad = 8.0;
-            cairo_rectangle(cr,
-                            text_x + ext.x_bearing - pad,
-                            text_y + ext.y_bearing - pad,
-                            ext.width + pad * 2.0,
-                            ext.height + pad * 2.0);
-            cairo_fill(cr);
+            RGBA fg = hex_to_rgba(color);
+            cairo_set_source_rgba(cr, fg.r, fg.g, fg.b, fg.a);
+            draw_latex_text(cr, text, text_x, text_y, font_size);
+        } else {
+            cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, font_size);
+
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, text.c_str(), &ext);
+            cached_text_w = std::max(ext.width, 10.0);
+            cached_text_h = std::max(ext.height, font_size * 0.75);
+            cached_x_bearing = ext.x_bearing;
+            cached_y_bearing = (ext.height > 0) ? ext.y_bearing : -font_size * 0.75;
+            text_metrics_valid = true;
+
+            if (!bg_color.empty() && bg_color != "transparent") {
+                RGBA bg = hex_to_rgba(bg_color);
+                cairo_set_source_rgba(cr, bg.r, bg.g, bg.b, bg.a);
+                double pad = 8.0;
+                cairo_rectangle(cr,
+                                text_x + ext.x_bearing - pad,
+                                text_y + ext.y_bearing - pad,
+                                ext.width + pad * 2.0,
+                                ext.height + pad * 2.0);
+                cairo_fill(cr);
+            }
+
+            RGBA fg = hex_to_rgba(color);
+            cairo_set_source_rgba(cr, fg.r, fg.g, fg.b, fg.a);
+            cairo_move_to(cr, text_x, text_y);
+            cairo_show_text(cr, text.c_str());
         }
-
-        RGBA fg = hex_to_rgba(color);
-        cairo_set_source_rgba(cr, fg.r, fg.g, fg.b, fg.a);
-        cairo_move_to(cr, text_x, text_y);
-        cairo_show_text(cr, text.c_str());
     }
 }
 

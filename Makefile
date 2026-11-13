@@ -6,10 +6,10 @@ PKG_LIBS   := $(shell pkg-config --libs cairo x11 xext xrandr) -lm
 TARGET     := screen-draw
 TEST_BIN   := build/test-screen-draw
 
-CORE_SRC   := src/geometry.cpp src/draw_item.cpp src/ipc.cpp src/toolbar.cpp src/window.cpp
+CORE_SRC   := src/geometry.cpp src/latex_math.cpp src/draw_item.cpp src/ipc.cpp src/toolbar.cpp src/window.cpp
 APP_SRC    := src/main.cpp $(CORE_SRC)
 TEST_SRC   := tests/test_main.cpp $(CORE_SRC)
-HEADERS    := src/geometry.hpp src/draw_item.hpp src/ipc.hpp src/window.hpp
+HEADERS    := src/geometry.hpp src/latex_math.hpp src/draw_item.hpp src/ipc.hpp src/window.hpp
 
 .PHONY: all test clean install
 

@@ -1,4 +1,5 @@
 #include "window.hpp"
+#include "latex_math.hpp"
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -696,6 +697,46 @@ void ScreenDrawWindow::draw_typing_text(cairo_t* cr) {
         cairo_line_to(cr, cursor_x, cursor_y - text_size * 0.8);
         cairo_set_line_width(cr, 2.0);
         cairo_stroke(cr);
+    }
+
+    if (contains_latex_math(typing_text)) {
+        MathMetrics pm = measure_latex_text(cr, typing_text, text_size);
+        double pad_x = 12.0;
+        double pad_y = 8.0;
+        double box_w = pm.width + pad_x * 2.0;
+        double box_h = pm.height + pad_y * 2.0;
+        double line_bot = typing_y + std::max(ext.height + ext.y_bearing, text_size * 0.25) + 12.0;
+        double line_top = typing_y + ((ext.height > 0) ? ext.y_bearing : -text_size * 0.75) - 12.0;
+
+        double box_x = std::clamp(typing_x - pad_x, 8.0, std::max(8.0, mon_width - box_w - 8.0));
+        double box_y = line_bot;
+        if (box_y + box_h > mon_height - 8.0 && line_top - box_h >= TOOLBAR_HEIGHT + 8.0) {
+            box_y = line_top - box_h;
+        }
+
+        cairo_save(cr);
+        rounded_rect(cr, box_x, box_y, box_w, box_h, 10.0);
+        if (!text_bg_color.empty() && text_bg_color != "transparent") {
+            RGBA bg = hex_to_rgba(text_bg_color, 0.94);
+            cairo_set_source_rgba(cr, bg.r, bg.g, bg.b, bg.a);
+        } else {
+            double lum = fg.r * 0.299 + fg.g * 0.587 + fg.b * 0.114;
+            if (lum < 0.25) {
+                cairo_set_source_rgba(cr, 0.95, 0.95, 0.97, 0.94);
+            } else {
+                cairo_set_source_rgba(cr, 0.11, 0.11, 0.13, 0.92);
+            }
+        }
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.14);
+        cairo_set_line_width(cr, 1.0);
+        cairo_stroke(cr);
+
+        cairo_set_source_rgba(cr, fg.r, fg.g, fg.b, fg.a);
+        double draw_x = box_x + pad_x - pm.x_bearing;
+        double draw_y = box_y + pad_y - pm.y_bearing;
+        draw_latex_text(cr, typing_text, draw_x, draw_y, text_size);
+        cairo_restore(cr);
     }
 }
 

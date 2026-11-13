@@ -1,4 +1,5 @@
 #include "../src/geometry.hpp"
+#include "../src/latex_math.hpp"
 #include "../src/draw_item.hpp"
 #include "../src/window.hpp"
 #include "../src/ipc.hpp"
@@ -452,6 +453,147 @@ static void test_ipc_socket_commands() {
     unlink(sock.c_str());
 }
 
+// ─── 5. LaTeX Math Tests ─────────────────────────────────────────────────────
+
+static bool surface_has_ink(cairo_surface_t* surf) {
+    cairo_surface_flush(surf);
+    int w = cairo_image_surface_get_width(surf);
+    int h = cairo_image_surface_get_height(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+    const unsigned char* data = cairo_image_surface_get_data(surf);
+    for (int y = 0; y < h; ++y) {
+        const uint32_t* row = (const uint32_t*)(data + y * stride);
+        for (int x = 0; x < w; ++x) {
+            if ((row[x] >> 24) != 0) return true;
+        }
+    }
+    return false;
+}
+
+static void test_latex_segment_splitting() {
+    CHECK(!contains_latex_math("Hello World"));
+    CHECK(!contains_latex_math("Price is $50"));
+    CHECK(!contains_latex_math("Empty $$$$"));
+    CHECK(!contains_latex_math("Unclosed $$\\alpha"));
+
+    CHECK(contains_latex_math("$$\\frac{a}{b}$$"));
+    CHECK(contains_latex_math("$\\alpha + \\beta$"));
+
+    auto s1 = split_latex_segments("$$\\frac{a}{b}$$");
+    CHECK(s1.size() == 1);
+    CHECK(s1[0].kind == TextSegment::Kind::DisplayMath);
+    CHECK(s1[0].content == "\\frac{a}{b}");
+
+    auto s2 = split_latex_segments("Area = $\\pi r^2$ and $$E = mc^2$$!");
+    CHECK(s2.size() == 5);
+    CHECK(s2[0].kind == TextSegment::Kind::Plain && s2[0].content == "Area = ");
+    CHECK(s2[1].kind == TextSegment::Kind::InlineMath && s2[1].content == "\\pi r^2");
+    CHECK(s2[2].kind == TextSegment::Kind::Plain && s2[2].content == " and ");
+    CHECK(s2[3].kind == TextSegment::Kind::DisplayMath && s2[3].content == "E = mc^2");
+    CHECK(s2[4].kind == TextSegment::Kind::Plain && s2[4].content == "!");
+
+    auto s3 = split_latex_segments("Cost \\$5 and $x = 1$");
+    CHECK(s3.size() == 2);
+    CHECK(s3[0].kind == TextSegment::Kind::Plain && s3[0].content == "Cost $5 and ");
+    CHECK(s3[1].kind == TextSegment::Kind::InlineMath && s3[1].content == "x = 1");
+}
+
+static void test_latex_math_measurement_and_rendering() {
+    cairo_surface_t* surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 800, 400);
+    cairo_t* cr = cairo_create(surf);
+
+    MathMetrics simple = measure_latex_text(cr, "$$x$$", 24.0);
+    MathMetrics frac = measure_latex_text(cr, "$$\\frac{a + b}{c + d}$$", 24.0);
+    MathMetrics rad = measure_latex_text(cr, "$$\\sqrt[3]{\\frac{x^2 + 1}{y_0}}$$", 24.0);
+    MathMetrics sum_inline = measure_latex_text(cr, "$\\sum_{i=1}^n i^2$", 24.0);
+    MathMetrics sum_display = measure_latex_text(cr, "$$\\sum_{i=1}^n i^2$$", 24.0);
+    MathMetrics mat = measure_latex_text(cr, "$$\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}$$", 24.0);
+
+    CHECK(simple.width > 5.0 && simple.height > 10.0);
+    CHECK(frac.height > simple.height * 1.4);
+    CHECK(rad.height > simple.height * 1.4);
+    CHECK(rad.width > simple.width * 2.0);
+    CHECK(sum_display.height > sum_inline.height);
+    CHECK(mat.height > simple.height * 1.8);
+
+    // Render complex expression and verify pixels are drawn
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+    const char* exprs[] = {
+        "$$\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}$$",
+        "$$\\left( \\vec{F} = m\\ddot{x} \\right) \\implies \\forall x \\in \\mathbb{R},\\; \\hat{x} \\neq 0$$",
+        "$$\\begin{cases} x^2 & \\text{if } x \\ge 0 \\\\ -x & \\text{otherwise} \\end{cases}$$",
+        "$$\\color{blue}{\\alpha} + \\mathcal{L}\\{f\\} + \\binom{n}{k}$$",
+        // Malformed / partial expressions must not crash
+        "$$\\frac{$$",
+        "$$\\left( x$$",
+        "$$\\unknowncmd^2_$$",
+        "$$\\sqrt[3]{$$",
+    };
+    for (int i = 0; i < 8; ++i) {
+        MathMetrics m = measure_latex_text(cr, exprs[i], 24.0);
+        CHECK(m.width > 0.0 && m.height > 0.0);
+        draw_latex_text(cr, exprs[i], 40.0, 40.0 + i * 40.0, 24.0);
+    }
+    CHECK(surface_has_ink(surf));
+
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+}
+
+static void test_draw_item_and_window_latex_math() {
+    DrawItem math_item;
+    math_item.kind = StrokeKind::Text;
+    math_item.text = "$$\\frac{a}{b} + \\alpha$$";
+    math_item.text_x = 200.0;
+    math_item.text_y = 200.0;
+    math_item.font_size = 32.0;
+    math_item.bg_color = "#000000";
+    math_item.update_text_metrics();
+
+    BBox b = math_item.raw_bounds();
+    CHECK(b.valid());
+    CHECK(b.width() > 30.0);
+    CHECK(b.height() > 30.0);
+    CHECK(math_item.hit_test((b.x1 + b.x2) * 0.5, (b.y1 + b.y2) * 0.5, false));
+
+    DrawItem orig = math_item;
+    math_item.apply_resize_from(orig, HandleId::SE, 80.0, 60.0);
+    CHECK(math_item.font_size > orig.font_size);
+
+    ScreenDrawWindow win(1920, 1080);
+    win.select_tool(ToolType::Text);
+    win.on_button_press(300, 300, 100, 0);
+    CHECK(win.is_typing);
+
+    const std::string input = "$$\\frac{1}{2}$$";
+    for (char c : input) {
+        std::string s(1, c);
+        win.handle_key_action(s, s, false);
+    }
+    CHECK(win.typing_text == input);
+
+    // Render while typing (exercises live LaTeX math preview)
+    cairo_surface_t* surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1920, 1080);
+    cairo_t* cr = cairo_create(surf);
+    cairo_rectangle_int_t clip = {0, 0, 1920, 1080};
+    win.on_draw(cr, 1920, 1080, clip);
+
+    // Commit and render committed item
+    win.handle_key_action("Return", "\r", false);
+    CHECK(!win.is_typing);
+    CHECK(win.strokes.size() == 1);
+    CHECK(win.strokes[0].text == input);
+    win.on_draw(cr, 1920, 1080, clip);
+
+    // Re-open with F2 preserves raw LaTeX source for editing
+    win.handle_key_action("F2", "", false);
+    CHECK(win.is_typing);
+    CHECK(win.typing_text == input);
+
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+}
+
 int main() {
     std::printf("Running Screen Draw test suite...\n");
     RUN_TEST(test_hex_to_rgba);
@@ -465,6 +607,9 @@ int main() {
     RUN_TEST(test_window_text_editing_and_navigation);
     RUN_TEST(test_window_rendering_and_toolbar);
     RUN_TEST(test_ipc_socket_commands);
+    RUN_TEST(test_latex_segment_splitting);
+    RUN_TEST(test_latex_math_measurement_and_rendering);
+    RUN_TEST(test_draw_item_and_window_latex_math);
     std::printf("All %d test suites (%d assertions) passed!\n", g_tests_run, g_checks_passed);
     return 0;
 }

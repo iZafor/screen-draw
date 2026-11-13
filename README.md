@@ -18,6 +18,7 @@ Draw directly over your screen with pens, shapes, text, and erasers — and free
   - **Edit existing text**: double-click a text annotation (any tool), click it with the Text tool, or select it and press `Enter` / `F2`. Reopening places the cursor at the exact clicked location
   - **Full cursor navigation**: click anywhere within the text or drag to position the cursor; navigate with `Left` / `Right` arrows, `Home` / `End` / `Up` / `Down`, and `Ctrl+Left` / `Ctrl+Right` (by word)
   - **In-place editing & deletion**: edit or insert text at the cursor position; delete with `BackSpace`, `Delete`, `Ctrl+BackSpace`, and `Ctrl+Delete`. Clearing all text removes the item; edits are undoable
+  - **LaTeX math support (`$...$` / `$$...$$`)**: write LaTeX math commands inside `$...$` or `$$...$$` (e.g., `$$\frac{a}{b}$$`, `$\alpha + \beta$`, `\sqrt`, superscripts/subscripts, `\sum`, `\int`, `\left( ... \right)`, matrices, accents, `\mathbb`, `\text`, and `\color`) with live preview while typing and full raw-source editing on double-click / `F2`
 - **Predefined shapes**: Rectangle, Circle/Ellipse, Arrow, Line
 - **Undo/Redo** (`Ctrl+Z` / `Ctrl+Y`) across drawing, moving, resizing, restyling, and deleting
 - **Clear canvas** shortcut (`Ctrl+X`)
